@@ -257,8 +257,11 @@ jobs:
           /** Runs [block] every time the screen comes back to the foreground. */
           @Composable
           fun OnResume(block: () -> Unit) {
+              // The first resume happens as the screen opens, when it is already loading;
+              // only react to real returns (e.g. back from the player).
+              val first = remember { booleanArrayOf(true) }
               LifecycleResumeEffect(Unit) {
-                  block()
+                  if (first[0]) first[0] = false else block()
                   onPauseOrDispose { }
               }
           }
@@ -577,9 +580,15 @@ jobs:
 
               LaunchedEffect(rk, reload) {
                   try {
+                      // Quick request first so the page appears immediately; trailers and
+                      // "More like this" (slow for the server to build) are merged in after.
                       val m = Plex.metadata(rk) ?: throw Exception("Not found on server")
-                      meta = m
+                      val old = meta
+                      meta = if (old != null && old.ratingKey == m.ratingKey) m.copy(extras = old.extras, related = old.related) else m
                       error = null
+                      launch {
+                          runCatching { Plex.metadata(rk, full = true) }.getOrNull()?.let { meta = it }
+                      }
                       if (m.type == "show") {
                           val s = Plex.children(rk)
                           seasons = s
@@ -1132,6 +1141,8 @@ jobs:
           import androidx.compose.ui.unit.dp
           import androidx.navigation.NavController
           import coil.compose.AsyncImage
+          import kotlinx.coroutines.async
+          import kotlinx.coroutines.coroutineScope
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
 
@@ -1143,9 +1154,16 @@ jobs:
               var refresh by remember { mutableIntStateOf(0) }
               OnResume { refresh++ }
               LaunchedEffect(refresh) {
+                  // Coming back to the Home tab within a minute shows what's already loaded.
+                  if (refresh == 0 && Cache.hubs != null && System.currentTimeMillis() - Cache.at < 60_000) return@LaunchedEffect
                   try {
-                      Cache.libs = Plex.libraries()
-                      Cache.hubs = Plex.homeHubs()
+                      coroutineScope {
+                          val l = async { Plex.libraries() }
+                          val h = async { Plex.homeHubs() }
+                          Cache.libs = l.await()
+                          Cache.hubs = h.await()
+                      }
+                      Cache.at = System.currentTimeMillis()
                       error = null
                   } catch (e: Exception) {
                       if (Cache.hubs == null) error = e.message ?: "Couldn't reach your server"
@@ -1186,7 +1204,7 @@ jobs:
               val libs = Cache.libs
               var menu by remember { mutableStateOf(false) }
               Box(Modifier.fillMaxWidth().height(540.dp)) {
-                  if (f != null) PlexImage(f.poster, 800, 1200, Modifier.fillMaxSize())
+                  if (f != null) PlexImage(f.poster, 600, 900, Modifier.fillMaxSize())
                   Box(
                       Modifier.fillMaxSize().background(
                           Brush.verticalGradient(
@@ -1551,13 +1569,26 @@ jobs:
           import androidx.navigation.compose.composable
           import androidx.navigation.compose.currentBackStackEntryAsState
           import androidx.navigation.compose.rememberNavController
+          import coil.ImageLoader
+          import coil.ImageLoaderFactory
+          import coil.disk.DiskCache
+          import coil.memory.MemoryCache
 
-          class FeynosApp : Application() {
+          class FeynosApp : Application(), ImageLoaderFactory {
               override fun onCreate() {
                   super.onCreate()
                   Plex.init(this)
                   Downloads.load()
               }
+
+              override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)
+                  .okHttpClient(Plex.http)
+                  .memoryCache { MemoryCache.Builder(this).maxSizePercent(0.25).build() }
+                  .diskCache { DiskCache.Builder().directory(cacheDir.resolve("img")).maxSizeBytes(300L * 1024 * 1024).build() }
+                  // Plex's photo transcoder doesn't send cache headers, so without this every image re-downloads.
+                  .respectCacheHeaders(false)
+                  .crossfade(150)
+                  .build()
           }
 
           enum class Stage { Login, Profiles, Servers, Main }
@@ -1623,7 +1654,9 @@ jobs:
           object Cache {
               var hubs by mutableStateOf<List<Hub>?>(null)
               var libs by mutableStateOf<List<Library>>(emptyList())
+              var at = 0L
               fun clear() {
+                  at = 0L
                   hubs = null
                   libs = emptyList()
               }
@@ -2910,10 +2943,11 @@ jobs:
           import kotlinx.coroutines.CoroutineScope
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.SupervisorJob
-          import kotlinx.coroutines.async
-          import kotlinx.coroutines.awaitAll
-          import kotlinx.coroutines.coroutineScope
+          import kotlinx.coroutines.CompletableDeferred
+          import kotlinx.coroutines.joinAll
+          import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
+          import okhttp3.Dispatcher
           import okhttp3.FormBody
           import okhttp3.OkHttpClient
           import okhttp3.Request
@@ -2950,6 +2984,8 @@ jobs:
               val bg = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
               val http: OkHttpClient = OkHttpClient.Builder()
+                  // OkHttp defaults to 5 parallel requests per host, which throttles a screen full of posters.
+                  .dispatcher(Dispatcher().apply { maxRequests = 64; maxRequestsPerHost = 16 })
                   .connectTimeout(12, TimeUnit.SECONDS)
                   .readTimeout(30, TimeUnit.SECONDS)
                   .build()
@@ -3066,18 +3102,18 @@ jobs:
               suspend fun probe(uri: String, token: String?): String =
                   JSONObject(request("$uri/identity", token, quick = true)).optJSONObject("MediaContainer")?.s("machineIdentifier") ?: ""
 
-              /** Tries every connection in parallel and returns the best one that answers. */
-              suspend fun connect(s: Server): String? = coroutineScope {
-                  val ordered = s.conns.sortedBy { c ->
-                      when {
-                          c.local && !c.relay -> 0
-                          !c.relay -> 1
-                          else -> 2
-                      }
+              /** Tries every connection in parallel and returns the first one that answers. */
+              suspend fun connect(s: Server): String? {
+                  if (s.conns.isEmpty()) return null
+                  val winner = CompletableDeferred<String?>()
+                  val jobs = s.conns.map { c ->
+                      bg.launch { runCatching { probe(c.uri, s.token) }.onSuccess { winner.complete(c.uri) } }
                   }
-                  ordered.map { c ->
-                      async { runCatching { probe(c.uri, s.token); c.uri }.getOrNull() }
-                  }.awaitAll().firstOrNull { it != null }
+                  bg.launch {
+                      jobs.joinAll()
+                      winner.complete(null)
+                  }
+                  return winner.await()
               }
 
               // ---------------- Plex Media Server ----------------
@@ -3128,8 +3164,10 @@ jobs:
                       Tag(if (k.contains("genre=")) k.substringAfter("genre=").substringBefore("&") else k, it.s("title") ?: "")
                   }
 
-              suspend fun metadata(rk: String): Item? =
-                  pms("/library/metadata/$rk?includeExtras=1&includeMarkers=1&includeRelated=1&includeOnDeck=1&checkFiles=0").metadata().firstOrNull()
+              /** [full] adds trailers and related hubs, which are slow for the server to assemble. */
+              suspend fun metadata(rk: String, full: Boolean = false): Item? =
+                  pms("/library/metadata/$rk?includeMarkers=1&includeOnDeck=1&checkFiles=0" + if (full) "&includeExtras=1&includeRelated=1" else "")
+                      .metadata().firstOrNull()
 
               suspend fun children(rk: String): List<Item> = pms("/library/metadata/$rk/children").metadata()
               suspend fun allLeaves(rk: String): List<Item> = pms("/library/metadata/$rk/allLeaves").metadata()
