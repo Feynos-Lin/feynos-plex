@@ -1,0 +1,3663 @@
+name: Build Feynos Plex
+
+# This one file IS the whole app: it writes the Android project, builds a signed APK,
+# and publishes it as a GitHub release (which the app checks for updates).
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Write project
+        run: |
+          set -e
+          mkdir -p "app"
+          cat > "app/build.gradle.kts" <<'FEYNOS_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          val buildNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+          val repoName = System.getenv("GITHUB_REPOSITORY") ?: ""
+
+          android {
+              namespace = "com.feynos.plex"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.feynos.plex"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = buildNumber
+                  versionName = "1.0.$buildNumber"
+                  buildConfigField("String", "REPO", "\"$repoName\"")
+              }
+
+              signingConfigs {
+                  create("release") {
+                      storeFile = rootProject.file("release.jks")
+                      storePassword = System.getenv("KS_PASS") ?: "feynosplex"
+                      keyAlias = System.getenv("KS_ALIAS") ?: "feynos"
+                      keyPassword = System.getenv("KS_PASS") ?: "feynosplex"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                      signingConfig = signingConfigs.getByName("release")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures {
+                  compose = true
+                  buildConfig = true
+              }
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+              packaging {
+                  resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+              }
+          }
+
+          dependencies {
+              val media3 = "1.5.1"
+              implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.navigation:navigation-compose:2.8.5")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.media3:media3-exoplayer:$media3")
+              implementation("androidx.media3:media3-exoplayer-hls:$media3")
+              implementation("androidx.media3:media3-ui:$media3")
+              implementation("io.coil-kt:coil-compose:2.7.0")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app"
+          cat > "app/proguard-rules.pro" <<'FEYNOS_EOF'
+          -dontwarn org.conscrypt.**
+          -dontwarn org.bouncycastle.**
+          -dontwarn org.openjsse.**
+          -dontwarn okhttp3.internal.platform.**
+          -keep class com.feynos.plex.BuildConfig { *; }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main"
+          cat > "app/src/main/AndroidManifest.xml" <<'FEYNOS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+              <application
+                  android:name=".FeynosApp"
+                  android:label="Feynos Plex"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:theme="@style/AppTheme"
+                  android:usesCleartextTraffic="true"
+                  android:supportsRtl="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".PlayerActivity"
+                      android:exported="false"
+                      android:launchMode="singleTask"
+                      android:screenOrientation="sensorLandscape"
+                      android:supportsPictureInPicture="true"
+                      android:resizeableActivity="true"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode" />
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.files"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/java/com/feynos/plex"
+          cat > "app/src/main/java/com/feynos/plex/Components.kt" <<'FEYNOS_EOF'
+          @file:OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+
+          package com.feynos.plex
+
+          import android.content.Context
+          import android.content.Intent
+          import android.widget.Toast
+          import androidx.compose.foundation.*
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.lifecycle.compose.LifecycleResumeEffect
+          import androidx.navigation.NavController
+          import coil.compose.AsyncImage
+          import kotlinx.coroutines.launch
+
+          val Accent = Color(0xFFE5A00D)
+          val Bg = Color(0xFF0A0A0A)
+          val Muted = Color(0xFFB3B3B3)
+          val Danger = Color(0xFFFF6B6B)
+
+          @Composable
+          fun FeynosTheme(content: @Composable () -> Unit) {
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = Accent,
+                      onPrimary = Color.Black,
+                      secondary = Accent,
+                      onSecondary = Color.Black,
+                      background = Bg,
+                      onBackground = Color.White,
+                      surface = Color(0xFF161616),
+                      onSurface = Color.White,
+                      surfaceVariant = Color(0xFF262626),
+                      onSurfaceVariant = Muted,
+                      surfaceContainer = Color(0xFF1C1C1C),
+                      surfaceContainerHigh = Color(0xFF242424),
+                      surfaceContainerHighest = Color(0xFF2C2C2C),
+                  ),
+                  content = content,
+              )
+          }
+
+          /** Runs [block] every time the screen comes back to the foreground. */
+          @Composable
+          fun OnResume(block: () -> Unit) {
+              LifecycleResumeEffect(Unit) {
+                  block()
+                  onPauseOrDispose { }
+              }
+          }
+
+          @Composable
+          fun Logo(size: Int = 34) {
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                  Box(
+                      Modifier.size(size.dp).clip(RoundedCornerShape(8.dp)).background(Accent),
+                      contentAlignment = Alignment.Center,
+                  ) {
+                      Text("F", color = Color.Black, fontWeight = FontWeight.Black, fontSize = (size * 0.6f).sp)
+                  }
+                  Spacer(Modifier.width(10.dp))
+                  Text("Feynos Plex", fontWeight = FontWeight.Bold, fontSize = (size * 0.6f).sp, color = Color.White)
+              }
+          }
+
+          @Composable
+          fun PlexImage(path: String?, w: Int, h: Int, modifier: Modifier = Modifier, scale: ContentScale = ContentScale.Crop) {
+              AsyncImage(
+                  model = Plex.img(path, w, h),
+                  contentDescription = null,
+                  contentScale = scale,
+                  modifier = modifier.background(Color(0xFF1F1F1F)),
+              )
+          }
+
+          @Composable
+          fun ProgressStrip(p: Float, modifier: Modifier = Modifier) {
+              Box(modifier.fillMaxWidth().height(3.dp).background(Color(0x55FFFFFF))) {
+                  Box(Modifier.fillMaxHeight().fillMaxWidth(p.coerceIn(0f, 1f)).background(Accent))
+              }
+          }
+
+          @Composable
+          fun PosterCard(
+              item: Item,
+              modifier: Modifier = Modifier.width(112.dp),
+              showTitle: Boolean = false,
+              onLongClick: (() -> Unit)? = null,
+              onClick: () -> Unit,
+          ) {
+              Column(modifier) {
+                  Box(
+                      Modifier.fillMaxWidth().aspectRatio(2f / 3f).clip(RoundedCornerShape(6.dp))
+                          .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+                  ) {
+                      PlexImage(item.poster, 300, 450, Modifier.fillMaxSize())
+                      val unwatched = item.leafCount - item.viewedLeafCount
+                      if (item.isWatched) {
+                          Box(
+                              Modifier.align(Alignment.TopEnd).padding(5.dp).size(20.dp).clip(CircleShape).background(Accent),
+                              contentAlignment = Alignment.Center,
+                          ) { Icon(Icons.Default.Check, null, tint = Color.Black, modifier = Modifier.size(14.dp)) }
+                      } else if ((item.type == "show" || item.type == "season") && unwatched > 0) {
+                          Box(
+                              Modifier.align(Alignment.TopEnd).padding(5.dp).clip(RoundedCornerShape(4.dp)).background(Accent)
+                                  .padding(horizontal = 5.dp, vertical = 1.dp)
+                          ) { Text("$unwatched", color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                      }
+                      if (item.progress > 0f) ProgressStrip(item.progress, Modifier.align(Alignment.BottomCenter))
+                  }
+                  if (showTitle) {
+                      Text(
+                          item.heading,
+                          style = MaterialTheme.typography.bodySmall,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis,
+                          modifier = Modifier.padding(top = 4.dp),
+                      )
+                      if (item.year > 0 && item.type != "episode") Text("${item.year}", style = MaterialTheme.typography.labelSmall, color = Muted)
+                  }
+              }
+          }
+
+          @Composable
+          fun WideCard(item: Item, modifier: Modifier = Modifier.width(232.dp), onLongClick: (() -> Unit)? = null, onClick: () -> Unit) {
+              Column(modifier.clip(RoundedCornerShape(6.dp)).combinedClickable(onClick = onClick, onLongClick = onLongClick)) {
+                  Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f)) {
+                      PlexImage(item.wideImage, 480, 270, Modifier.fillMaxSize())
+                      Box(
+                          Modifier.align(Alignment.Center).size(42.dp).clip(CircleShape).background(Color(0x99000000))
+                              .border(1.5.dp, Color.White, CircleShape),
+                          contentAlignment = Alignment.Center,
+                      ) { Icon(Icons.Default.PlayArrow, null, tint = Color.White) }
+                      if (item.progress > 0f) ProgressStrip(item.progress, Modifier.align(Alignment.BottomCenter))
+                  }
+                  Column(Modifier.fillMaxWidth().background(Color(0xFF1A1A1A)).padding(horizontal = 8.dp, vertical = 6.dp)) {
+                      Text(item.heading, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                      val sub = item.subheading.ifEmpty { fmtDuration(item.duration) }
+                      Text(sub, style = MaterialTheme.typography.bodySmall, color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  }
+              }
+          }
+
+          @Composable
+          fun HubRow(hub: Hub, nav: NavController) {
+              val ctx = LocalContext.current
+              val wide = hub.isContinue || hub.type == "episode"
+              Column(Modifier.padding(top = 16.dp)) {
+                  Text(
+                      hub.title,
+                      style = MaterialTheme.typography.titleMedium,
+                      fontWeight = FontWeight.Bold,
+                      modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                  )
+                  LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      items(hub.items) { x ->
+                          if (wide) {
+                              WideCard(x, onLongClick = { nav.openItem(x) }) {
+                                  if (hub.isContinue && x.playable) ctx.play(x, resume = true) else nav.openItem(x)
+                              }
+                          } else {
+                              PosterCard(x) { nav.openItem(x) }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun ScreenTitle(title: String, onBack: (() -> Unit)? = null, actions: @Composable RowScope.() -> Unit = {}) {
+              Row(
+                  Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 4.dp, vertical = 6.dp).height(48.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+              ) {
+                  if (onBack != null) {
+                      IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
+                  } else {
+                      Spacer(Modifier.width(12.dp))
+                  }
+                  Text(
+                      title,
+                      style = MaterialTheme.typography.titleLarge,
+                      fontWeight = FontWeight.Bold,
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis,
+                      modifier = Modifier.weight(1f),
+                  )
+                  actions()
+              }
+          }
+
+          @Composable
+          fun Loading() {
+              Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Accent) }
+          }
+
+          @Composable
+          fun Message(text: String, actions: @Composable ColumnScope.() -> Unit = {}) {
+              Column(
+                  Modifier.fillMaxSize().padding(32.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally,
+                  verticalArrangement = Arrangement.Center,
+              ) {
+                  Text(text, color = Muted, textAlign = TextAlign.Center)
+                  Spacer(Modifier.height(12.dp))
+                  actions()
+              }
+          }
+
+          @Composable
+          fun PillButton(text: String, onClick: () -> Unit) {
+              Box(
+                  Modifier.clip(RoundedCornerShape(50)).border(1.dp, Color(0x99FFFFFF), RoundedCornerShape(50))
+                      .clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 6.dp)
+              ) { Text(text, style = MaterialTheme.typography.labelLarge, color = Color.White) }
+          }
+
+          @Composable
+          fun ActionIcon(icon: ImageVector, label: String, tint: Color = Color.White, onClick: () -> Unit) {
+              Column(
+                  Modifier.clip(RoundedCornerShape(8.dp)).clickable(onClick = onClick).padding(horizontal = 12.dp, vertical = 6.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally,
+              ) {
+                  Icon(icon, null, tint = tint)
+                  Spacer(Modifier.height(2.dp))
+                  Text(label, style = MaterialTheme.typography.labelSmall, color = Muted)
+              }
+          }
+
+          @Composable
+          fun DownloadIcon(item: Item) {
+              val ctx = LocalContext.current
+              val d = Downloads.list.firstOrNull { it.rk == item.ratingKey }
+              IconButton(onClick = {
+                  if (d == null) {
+                      if (Downloads.start(ctx, item)) ctx.toast("Downloading ${item.title}") else ctx.toast("Can't download this")
+                  } else ctx.toast("Already in Downloads")
+              }) {
+                  Icon(
+                      if (d == null) Icons.Default.Download else Icons.Default.DownloadDone,
+                      "Download",
+                      tint = if (d == null) Color.White else Accent,
+                  )
+              }
+          }
+
+          @Composable
+          fun UpdateDialog(r: Updater.Release, onDismiss: () -> Unit) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var progress by remember { mutableStateOf<Float?>(null) }
+              var err by remember { mutableStateOf<String?>(null) }
+              AlertDialog(
+                  onDismissRequest = { if (progress == null) onDismiss() },
+                  title = { Text("Update available") },
+                  text = {
+                      Column(Modifier.verticalScroll(rememberScrollState())) {
+                          Text(r.name, fontWeight = FontWeight.Bold)
+                          if (r.notes.isNotBlank()) Text(r.notes, color = Muted, modifier = Modifier.padding(top = 8.dp))
+                          progress?.let { p ->
+                              LinearProgressIndicator(progress = { p }, modifier = Modifier.fillMaxWidth().padding(top = 12.dp), color = Accent)
+                          }
+                          err?.let { Text(it, color = Danger, modifier = Modifier.padding(top = 8.dp)) }
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(enabled = progress == null, onClick = {
+                          progress = 0f
+                          err = null
+                          scope.launch {
+                              try {
+                                  val f = Updater.download(r) { p -> progress = p }
+                                  progress = null
+                                  Updater.install(ctx, f)
+                                  onDismiss()
+                              } catch (e: Exception) {
+                                  err = e.message ?: "Update failed"
+                                  progress = null
+                              }
+                          }
+                      }) { Text("Update") }
+                  },
+                  dismissButton = { TextButton(enabled = progress == null, onClick = onDismiss) { Text("Later") } },
+              )
+          }
+
+          fun Context.toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+          fun NavController.openItem(item: Item) {
+              val rk = when (item.type) {
+                  "episode" -> item.grandparentRatingKey ?: item.ratingKey
+                  "season" -> item.parentRatingKey ?: item.ratingKey
+                  else -> item.ratingKey
+              }
+              navigate("detail/$rk")
+          }
+
+          fun Context.play(item: Item, resume: Boolean) {
+              val local = Downloads.find(item.ratingKey)?.takeIf { Downloads.isComplete(this, it) }
+              val i = Intent(this, PlayerActivity::class.java)
+                  .putExtra("rk", item.ratingKey)
+                  .putExtra("offset", if (resume) item.viewOffset else 0L)
+              if (local != null) i.putExtra("local", local.file)
+              startActivity(i)
+          }
+
+          fun fmtDuration(ms: Long): String {
+              if (ms <= 0) return ""
+              val m = ms / 60000
+              return if (m >= 60) "${m / 60}h ${m % 60}m" else "${m}m"
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/java/com/feynos/plex"
+          cat > "app/src/main/java/com/feynos/plex/Detail.kt" <<'FEYNOS_EOF'
+          @file:OptIn(ExperimentalMaterial3Api::class)
+
+          package com.feynos.plex
+
+          import androidx.compose.foundation.*
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.navigation.NavController
+          import coil.compose.AsyncImage
+          import kotlinx.coroutines.launch
+
+          @Composable
+          fun DetailScreen(nav: NavController, rk: String) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var meta by remember { mutableStateOf<Item?>(null) }
+              var error by remember { mutableStateOf<String?>(null) }
+              var seasons by remember { mutableStateOf<List<Item>>(emptyList()) }
+              var seasonKey by rememberSaveable { mutableStateOf<String?>(null) }
+              var episodes by remember { mutableStateOf<List<Item>>(emptyList()) }
+              var episodesFor by remember { mutableStateOf<String?>(null) }
+              var reload by remember { mutableIntStateOf(0) }
+              var expanded by remember { mutableStateOf(false) }
+              var seasonMenu by remember { mutableStateOf(false) }
+
+              OnResume { reload++ }
+
+              LaunchedEffect(rk, reload) {
+                  try {
+                      val m = Plex.metadata(rk) ?: throw Exception("Not found on server")
+                      meta = m
+                      error = null
+                      if (m.type == "show") {
+                          val s = Plex.children(rk)
+                          seasons = s
+                          val cur = seasonKey
+                          if (cur == null || s.none { it.ratingKey == cur }) {
+                              seasonKey = (s.firstOrNull { it.ratingKey == m.onDeck?.parentRatingKey }
+                                  ?: s.firstOrNull { it.index > 0 } ?: s.firstOrNull())?.ratingKey
+                          }
+                      }
+                  } catch (e: Exception) {
+                      if (meta == null) error = e.message ?: "Couldn't load"
+                  }
+              }
+
+              LaunchedEffect(seasonKey, reload) {
+                  val k = seasonKey ?: return@LaunchedEffect
+                  if (episodesFor != k) episodes = emptyList()
+                  runCatching { Plex.children(k) }.onSuccess {
+                      episodes = it
+                      episodesFor = k
+                  }
+              }
+
+              val m = meta
+              if (m == null) {
+                  val err = error
+                  if (err != null) {
+                      Message("Couldn't open this title.\n$err") {
+                          Button(onClick = { reload++ }) { Text("Retry") }
+                          TextButton(onClick = { nav.popBackStack() }) { Text("Back") }
+                      }
+                  } else Loading()
+                  return
+              }
+
+              val trailer = m.extras.firstOrNull { it.subtype == "trailer" } ?: m.extras.firstOrNull()
+              val target: Item? = when (m.type) {
+                  "show" -> m.onDeck ?: episodes.firstOrNull()
+                  "season" -> null
+                  else -> m
+              }
+              val resume = target != null && target.viewOffset > 60_000 && target.progress < 0.95f
+              val playLabel = when {
+                  target == null -> "Play"
+                  m.type == "show" -> (if (resume) "Resume " else "Play ") + target.epLabel
+                  resume -> "Resume"
+                  else -> "Play"
+              }
+
+              LazyColumn(Modifier.fillMaxSize()) {
+                  item {
+                      Box(Modifier.fillMaxWidth().aspectRatio(16f / 10f)) {
+                          PlexImage(m.backdrop, 1280, 800, Modifier.fillMaxSize())
+                          Box(
+                              Modifier.fillMaxSize().background(
+                                  Brush.verticalGradient(0f to Color(0x99000000), 0.3f to Color.Transparent, 1f to Bg)
+                              )
+                          )
+                          IconButton(
+                              onClick = { nav.popBackStack() },
+                              modifier = Modifier.statusBarsPadding().padding(6.dp).clip(CircleShape).background(Color(0x66000000)),
+                          ) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Color.White) }
+                          if (trailer != null) {
+                              IconButton(
+                                  onClick = { ctx.play(trailer, false) },
+                                  modifier = Modifier.align(Alignment.Center).size(64.dp).clip(CircleShape).background(Color(0x66000000)),
+                              ) { Icon(Icons.Default.PlayArrow, "Play trailer", Modifier.size(40.dp), tint = Color.White) }
+                          }
+                      }
+                  }
+
+                  item {
+                      Column(Modifier.padding(horizontal = 16.dp)) {
+                          Text(m.heading, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                          if (m.type == "episode") Text("${m.epLabel} · ${m.title}", style = MaterialTheme.typography.titleMedium)
+                          MetaRow(m, if (seasons.isNotEmpty()) seasons.size else m.childCount)
+                          Spacer(Modifier.height(14.dp))
+
+                          if (target != null) {
+                              Button(
+                                  onClick = { ctx.play(target, resume = resume) },
+                                  modifier = Modifier.fillMaxWidth().height(46.dp),
+                                  shape = RoundedCornerShape(6.dp),
+                                  colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
+                              ) {
+                                  Icon(Icons.Default.PlayArrow, null)
+                                  Spacer(Modifier.width(6.dp))
+                                  Text(playLabel, fontWeight = FontWeight.Bold)
+                              }
+                              if (resume) {
+                                  Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                      ProgressStrip(target.progress, Modifier.weight(1f))
+                                      Spacer(Modifier.width(10.dp))
+                                      Text("${fmtDuration(target.duration - target.viewOffset)} left", color = Muted, fontSize = 12.sp)
+                                  }
+                                  Spacer(Modifier.height(8.dp))
+                                  OutlinedButton(
+                                      onClick = { ctx.play(target, resume = false) },
+                                      modifier = Modifier.fillMaxWidth().height(44.dp),
+                                      shape = RoundedCornerShape(6.dp),
+                                  ) {
+                                      Icon(Icons.Default.Replay, null)
+                                      Spacer(Modifier.width(6.dp))
+                                      Text("Play from beginning")
+                                  }
+                              }
+                          }
+                          if (m.playable) {
+                              Spacer(Modifier.height(8.dp))
+                              DownloadButton(m)
+                          }
+
+                          Spacer(Modifier.height(12.dp))
+                          m.tagline?.let { Text(it, fontStyle = FontStyle.Italic, color = Muted) }
+                          m.summary?.let {
+                              Text(
+                                  it,
+                                  maxLines = if (expanded) Int.MAX_VALUE else 4,
+                                  overflow = TextOverflow.Ellipsis,
+                                  modifier = Modifier.clickable { expanded = !expanded }.padding(vertical = 6.dp),
+                              )
+                          }
+                          if (m.cast.isNotEmpty()) {
+                              Text("Starring: " + m.cast.take(4).joinToString { it.name }, color = Muted, fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                          }
+                          if (m.directors.isNotEmpty()) Text("Director: " + m.directors.joinToString(), color = Muted, fontSize = 13.sp)
+                          if (m.genres.isNotEmpty()) Text("Genres: " + m.genres.joinToString(), color = Muted, fontSize = 13.sp)
+
+                          Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                              if (Watchlist.supports(m)) {
+                                  val inList = Watchlist.has(m.guid)
+                                  ActionIcon(if (inList) Icons.Default.Check else Icons.Default.Add, "My List", tint = if (inList) Accent else Color.White) {
+                                      scope.launch { Watchlist.toggle(m) }
+                                  }
+                              }
+                              ActionIcon(
+                                  if (m.isWatched) Icons.Default.CheckCircle else Icons.Default.Visibility,
+                                  if (m.isWatched) "Watched" else "Mark watched",
+                                  tint = if (m.isWatched) Accent else Color.White,
+                              ) {
+                                  scope.launch {
+                                      runCatching { Plex.scrobble(m.ratingKey, !m.isWatched) }
+                                      reload++
+                                  }
+                              }
+                              if (trailer != null) ActionIcon(Icons.Default.Movie, "Trailer") { ctx.play(trailer, false) }
+                              val show = m.grandparentRatingKey
+                              if (m.type == "episode" && show != null) ActionIcon(Icons.Default.Tv, "Show") { nav.navigate("detail/$show") }
+                          }
+                      }
+                  }
+
+                  if (m.type == "show" && seasons.isNotEmpty()) {
+                      item {
+                          Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                              val cur = seasons.firstOrNull { it.ratingKey == seasonKey }
+                              OutlinedButton(onClick = { seasonMenu = true }, shape = RoundedCornerShape(6.dp)) {
+                                  Text(cur?.title ?: "Season", fontWeight = FontWeight.SemiBold)
+                                  Icon(Icons.Default.ArrowDropDown, null)
+                              }
+                              DropdownMenu(expanded = seasonMenu, onDismissRequest = { seasonMenu = false }) {
+                                  seasons.forEach { s ->
+                                      DropdownMenuItem(
+                                          text = { Text(s.title + if (s.leafCount > 0) "  ·  ${s.leafCount} episodes" else "") },
+                                          trailingIcon = { if (s.isWatched) Icon(Icons.Default.Check, null, tint = Accent) },
+                                          onClick = {
+                                              seasonKey = s.ratingKey
+                                              seasonMenu = false
+                                          },
+                                      )
+                                  }
+                              }
+                          }
+                      }
+                      if (episodes.isEmpty()) item {
+                          Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Accent) }
+                      }
+                      items(episodes) { ep ->
+                          EpisodeRow(
+                              ep,
+                              onPlay = { ctx.play(ep, resume = true) },
+                              onToggleWatched = {
+                                  scope.launch {
+                                      runCatching { Plex.scrobble(ep.ratingKey, !ep.isWatched) }
+                                      reload++
+                                  }
+                              },
+                          )
+                      }
+                  }
+
+                  if (m.cast.isNotEmpty()) item { CastRow(m.cast) }
+                  items(m.related) { h -> HubRow(h, nav) }
+                  item { Spacer(Modifier.height(32.dp)) }
+              }
+          }
+
+          @Composable
+          private fun MetaRow(m: Item, seasonCount: Int) {
+              Row(
+                  Modifier.padding(top = 6.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(10.dp),
+              ) {
+                  if (m.year > 0) Text("${m.year}", color = Muted)
+                  m.contentRating?.let {
+                      Text(
+                          it,
+                          color = Muted,
+                          fontSize = 12.sp,
+                          modifier = Modifier.border(1.dp, Muted, RoundedCornerShape(3.dp)).padding(horizontal = 5.dp, vertical = 1.dp),
+                      )
+                  }
+                  if (m.type == "show") {
+                      if (seasonCount > 0) Text(if (seasonCount == 1) "1 Season" else "$seasonCount Seasons", color = Muted)
+                  } else if (m.duration > 0) Text(fmtDuration(m.duration), color = Muted)
+                  m.media.firstOrNull()?.videoResolution?.let { r ->
+                      val label = when (r.lowercase()) {
+                          "4k" -> "4K"
+                          "1080", "720" -> "HD"
+                          else -> r.uppercase()
+                      }
+                      Text(
+                          label,
+                          color = Muted,
+                          fontSize = 11.sp,
+                          fontWeight = FontWeight.Bold,
+                          modifier = Modifier.border(1.dp, Muted, RoundedCornerShape(3.dp)).padding(horizontal = 5.dp, vertical = 1.dp),
+                      )
+                  }
+                  if (m.audienceRating > 0) Text("★ ${"%.1f".format(m.audienceRating)}", color = Accent)
+              }
+          }
+
+          @Composable
+          private fun EpisodeRow(ep: Item, onPlay: () -> Unit, onToggleWatched: () -> Unit) {
+              Column(Modifier.fillMaxWidth().clickable(onClick = onPlay).padding(horizontal = 16.dp, vertical = 10.dp)) {
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Box(Modifier.width(136.dp).aspectRatio(16f / 9f).clip(RoundedCornerShape(4.dp))) {
+                          PlexImage(ep.thumb, 400, 225, Modifier.fillMaxSize())
+                          Icon(
+                              Icons.Default.PlayArrow,
+                              null,
+                              tint = Color.White,
+                              modifier = Modifier.align(Alignment.Center).size(30.dp).clip(CircleShape).background(Color(0x88000000)).padding(4.dp),
+                          )
+                          if (ep.progress > 0f) ProgressStrip(ep.progress, Modifier.align(Alignment.BottomCenter))
+                      }
+                      Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                          Text(
+                              "${ep.index}. ${ep.title}",
+                              style = MaterialTheme.typography.bodyLarge,
+                              fontWeight = FontWeight.SemiBold,
+                              maxLines = 2,
+                              overflow = TextOverflow.Ellipsis,
+                          )
+                          Text(fmtDuration(ep.duration), color = Muted, style = MaterialTheme.typography.bodySmall)
+                      }
+                      IconButton(onClick = onToggleWatched) {
+                          Icon(
+                              if (ep.isWatched) Icons.Default.CheckCircle else Icons.Default.Check,
+                              "Watched",
+                              tint = if (ep.isWatched) Accent else Color(0xFF666666),
+                          )
+                      }
+                      DownloadIcon(ep)
+                  }
+                  ep.summary?.let {
+                      Text(
+                          it,
+                          color = Muted,
+                          style = MaterialTheme.typography.bodySmall,
+                          maxLines = 3,
+                          overflow = TextOverflow.Ellipsis,
+                          modifier = Modifier.padding(top = 6.dp),
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun CastRow(cast: List<Person>) {
+              Column(Modifier.padding(top = 12.dp)) {
+                  Text(
+                      "Cast",
+                      style = MaterialTheme.typography.titleMedium,
+                      fontWeight = FontWeight.Bold,
+                      modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                  )
+                  LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                      items(cast.take(25)) { p ->
+                          Column(Modifier.width(84.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                              AsyncImage(
+                                  model = Plex.img(p.thumb, 200, 200),
+                                  contentDescription = p.name,
+                                  contentScale = ContentScale.Crop,
+                                  modifier = Modifier.size(72.dp).clip(CircleShape).background(Color(0xFF2A2A2A)),
+                              )
+                              Spacer(Modifier.height(4.dp))
+                              Text(p.name, fontSize = 12.sp, maxLines = 2, textAlign = TextAlign.Center, overflow = TextOverflow.Ellipsis)
+                              p.role?.let { Text(it, fontSize = 11.sp, color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun DownloadButton(item: Item) {
+              val ctx = LocalContext.current
+              val d = Downloads.list.firstOrNull { it.rk == item.ratingKey }
+              OutlinedButton(
+                  onClick = {
+                      if (d == null) {
+                          if (Downloads.start(ctx, item)) ctx.toast("Downloading ${item.title}") else ctx.toast("Can't download this")
+                      } else ctx.toast("Already in Downloads")
+                  },
+                  modifier = Modifier.fillMaxWidth().height(44.dp),
+                  shape = RoundedCornerShape(6.dp),
+              ) {
+                  Icon(if (d == null) Icons.Default.Download else Icons.Default.DownloadDone, null)
+                  Spacer(Modifier.width(6.dp))
+                  Text(if (d == null) "Download" else "In Downloads")
+              }
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/java/com/feynos/plex"
+          cat > "app/src/main/java/com/feynos/plex/Downloads.kt" <<'FEYNOS_EOF'
+          package com.feynos.plex
+
+          import android.app.DownloadManager
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Environment
+          import android.provider.Settings
+          import androidx.compose.runtime.mutableStateListOf
+          import androidx.core.content.FileProvider
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import okhttp3.Request
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+
+          data class DownloadEntry(
+              val rk: String,
+              val title: String,
+              val subtitle: String,
+              val thumb: String,
+              val file: String,
+              val dmId: Long,
+              val duration: Long,
+          )
+
+          object Downloads {
+              val list = mutableStateListOf<DownloadEntry>()
+
+              data class Status(val state: Int, val progress: Float)
+
+              fun load() {
+                  list.clear()
+                  val s = Plex.prefs.downloadsJson ?: return
+                  runCatching {
+                      JSONArray(s).objs().forEach { o ->
+                          list.add(
+                              DownloadEntry(
+                                  o.optString("rk"), o.optString("title"), o.optString("subtitle"), o.optString("thumb"),
+                                  o.optString("file"), o.optLong("dmId"), o.optLong("duration"),
+                              )
+                          )
+                      }
+                  }
+              }
+
+              private fun save() {
+                  val a = JSONArray()
+                  list.forEach { d ->
+                      a.put(
+                          JSONObject().put("rk", d.rk).put("title", d.title).put("subtitle", d.subtitle).put("thumb", d.thumb)
+                              .put("file", d.file).put("dmId", d.dmId).put("duration", d.duration)
+                      )
+                  }
+                  Plex.prefs.downloadsJson = a.toString()
+              }
+
+              fun find(rk: String): DownloadEntry? = list.firstOrNull { it.rk == rk }
+
+              fun start(ctx: Context, item: Item): Boolean {
+                  val part = item.media.firstOrNull()?.parts?.firstOrNull() ?: return false
+                  val ext = part.container ?: part.file?.substringAfterLast('.', "mkv") ?: "mkv"
+                  val name = "${item.ratingKey}.$ext"
+                  val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: return false
+                  val dest = File(dir, name)
+                  if (dest.exists()) dest.delete()
+                  val title = if (item.type == "episode") "${item.heading} · ${item.epLabel}" else item.title
+                  val req = DownloadManager.Request(Uri.parse(Plex.downloadUrl(part)))
+                      .setTitle(title)
+                      .setDescription("Feynos Plex")
+                      .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                      .setDestinationInExternalFilesDir(ctx, Environment.DIRECTORY_MOVIES, name)
+                      .setAllowedOverMetered(true)
+                      .setAllowedOverRoaming(true)
+                  val dm = ctx.getSystemService(DownloadManager::class.java) ?: return false
+                  val id = dm.enqueue(req)
+
+                  val thumbFile = File(ctx.filesDir, "thumbs/${item.ratingKey}.jpg")
+                  val thumbUrl = Plex.img(item.poster, 300, 450)
+                  if (thumbUrl != null) {
+                      Plex.bg.launch {
+                          runCatching {
+                              thumbFile.parentFile?.mkdirs()
+                              Plex.http.newCall(Request.Builder().url(thumbUrl).build()).execute().use { r ->
+                                  r.body?.byteStream()?.use { input -> thumbFile.outputStream().use { input.copyTo(it) } }
+                              }
+                          }
+                      }
+                  }
+
+                  list.removeAll { it.rk == item.ratingKey }
+                  list.add(
+                      0,
+                      DownloadEntry(
+                          rk = item.ratingKey,
+                          title = item.heading,
+                          subtitle = if (item.type == "episode") "${item.epLabel} · ${item.title}" else if (item.year > 0) "${item.year}" else "",
+                          thumb = thumbFile.absolutePath,
+                          file = dest.absolutePath,
+                          dmId = id,
+                          duration = item.duration,
+                      )
+                  )
+                  save()
+                  return true
+              }
+
+              fun status(ctx: Context, d: DownloadEntry): Status {
+                  val dm = ctx.getSystemService(DownloadManager::class.java)
+                  val fallback = Status(if (File(d.file).exists()) DownloadManager.STATUS_SUCCESSFUL else DownloadManager.STATUS_FAILED, 1f)
+                  if (dm == null) return fallback
+                  return runCatching {
+                      dm.query(DownloadManager.Query().setFilterById(d.dmId)).use { c ->
+                          if (c == null || !c.moveToFirst()) return@use fallback
+                          val st = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                          val done = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
+                          val total = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
+                          Status(st, if (total > 0) done.toFloat() / total else 0f)
+                      }
+                  }.getOrDefault(fallback)
+              }
+
+              fun isComplete(ctx: Context, d: DownloadEntry) = status(ctx, d).state == DownloadManager.STATUS_SUCCESSFUL
+
+              fun delete(ctx: Context, d: DownloadEntry) {
+                  runCatching { ctx.getSystemService(DownloadManager::class.java)?.remove(d.dmId) }
+                  File(d.file).delete()
+                  File(d.thumb).delete()
+                  list.remove(d)
+                  save()
+              }
+          }
+
+          object Updater {
+              data class Release(val build: Int, val name: String, val notes: String, val apkUrl: String)
+
+              suspend fun latest(): Release? {
+                  if (BuildConfig.REPO.isBlank()) return null
+                  return runCatching {
+                      val o = JSONObject(Plex.request("https://api.github.com/repos/${BuildConfig.REPO}/releases/latest", null))
+                      val tag = o.s("tag_name") ?: return null
+                      val build = tag.substringAfterLast('.').filter { it.isDigit() }.toIntOrNull() ?: return null
+                      val apk = o.optJSONArray("assets").objs().firstOrNull { (it.s("name") ?: "").endsWith(".apk") }?.s("browser_download_url")
+                          ?: return null
+                      Release(build, o.s("name") ?: tag, o.s("body") ?: "", apk)
+                  }.getOrNull()
+              }
+
+              suspend fun check(): Release? = latest()?.takeIf { it.build > BuildConfig.VERSION_CODE }
+
+              suspend fun download(r: Release, onProgress: (Float) -> Unit): File = withContext(Dispatchers.IO) {
+                  val f = File(Plex.app.cacheDir, "update.apk")
+                  Plex.http.newCall(Request.Builder().url(r.apkUrl).build()).execute().use { resp ->
+                      if (!resp.isSuccessful) throw Exception("Download failed (HTTP ${resp.code})")
+                      val body = resp.body ?: throw Exception("Empty download")
+                      val total = body.contentLength()
+                      body.byteStream().use { input ->
+                          f.outputStream().use { out ->
+                              val buf = ByteArray(64 * 1024)
+                              var read = 0L
+                              while (true) {
+                                  val n = input.read(buf)
+                                  if (n < 0) break
+                                  out.write(buf, 0, n)
+                                  read += n
+                                  if (total > 0) onProgress(read.toFloat() / total)
+                              }
+                          }
+                      }
+                  }
+                  f
+              }
+
+              fun install(ctx: Context, f: File) {
+                  if (!ctx.packageManager.canRequestPackageInstalls()) {
+                      ctx.startActivity(
+                          Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${ctx.packageName}"))
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      )
+                      return
+                  }
+                  val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", f)
+                  ctx.startActivity(
+                      Intent(Intent.ACTION_VIEW)
+                          .setDataAndType(uri, "application/vnd.android.package-archive")
+                          .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                  )
+              }
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/java/com/feynos/plex"
+          cat > "app/src/main/java/com/feynos/plex/Home.kt" <<'FEYNOS_EOF'
+          @file:OptIn(ExperimentalMaterial3Api::class)
+
+          package com.feynos.plex
+
+          import android.net.Uri
+          import androidx.compose.foundation.*
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.*
+          import androidx.compose.foundation.lazy.grid.*
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.navigation.NavController
+          import coil.compose.AsyncImage
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+
+          fun libRoute(l: Library) = "library/${l.key}/${l.type}/${Uri.encode(l.title)}"
+
+          @Composable
+          fun HomeScreen(nav: NavController) {
+              var error by remember { mutableStateOf<String?>(null) }
+              var refresh by remember { mutableIntStateOf(0) }
+              OnResume { refresh++ }
+              LaunchedEffect(refresh) {
+                  try {
+                      Cache.libs = Plex.libraries()
+                      Cache.hubs = Plex.homeHubs()
+                      error = null
+                  } catch (e: Exception) {
+                      if (Cache.hubs == null) error = e.message ?: "Couldn't reach your server"
+                  }
+              }
+              val hubs = Cache.hubs
+              val err = error
+              when {
+                  hubs == null && err != null -> Message("Couldn't reach ${Plex.prefs.serverName ?: "your server"}.\n$err") {
+                      Button(onClick = { refresh++ }) { Text("Retry") }
+                      TextButton(onClick = { nav.navigate("downloads") }) { Text("Go to Downloads") }
+                      TextButton(onClick = { Session.switchServer() }) { Text("Switch server") }
+                  }
+                  hubs == null -> Loading()
+                  else -> HomeContent(nav, hubs)
+              }
+          }
+
+          @Composable
+          private fun HomeContent(nav: NavController, hubs: List<Hub>) {
+              val featured = remember(hubs.map { it.identifier }) {
+                  hubs.filter { !it.isContinue }.flatMap { it.items }
+                      .filter { it.type == "movie" || it.type == "show" || it.type == "season" || it.type == "episode" }
+                      .shuffled().firstOrNull()
+              }
+              LazyColumn(Modifier.fillMaxSize()) {
+                  item { Hero(nav, featured) }
+                  if (hubs.isEmpty()) item { Text("Nothing here yet — add some media to your server.", color = Muted, modifier = Modifier.padding(16.dp)) }
+                  items(hubs) { h -> HubRow(h, nav) }
+                  item { Spacer(Modifier.height(24.dp)) }
+              }
+          }
+
+          @Composable
+          private fun Hero(nav: NavController, f: Item?) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val libs = Cache.libs
+              var menu by remember { mutableStateOf(false) }
+              Box(Modifier.fillMaxWidth().height(540.dp)) {
+                  if (f != null) PlexImage(f.poster, 800, 1200, Modifier.fillMaxSize())
+                  Box(
+                      Modifier.fillMaxSize().background(
+                          Brush.verticalGradient(
+                              0f to Color(0xCC000000),
+                              0.22f to Color.Transparent,
+                              0.55f to Color.Transparent,
+                              1f to Bg,
+                          )
+                      )
+                  )
+                  Column(Modifier.statusBarsPadding().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Logo(28)
+                          Spacer(Modifier.weight(1f))
+                          AsyncImage(
+                              model = Plex.prefs.userThumb,
+                              contentDescription = "Profile",
+                              contentScale = ContentScale.Crop,
+                              modifier = Modifier.size(30.dp).clip(RoundedCornerShape(5.dp)).background(Color(0xFF444444))
+                                  .clickable { nav.navigate("more") },
+                          )
+                      }
+                      Row(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          libs.firstOrNull { it.type == "show" }?.let { l -> PillButton("TV Shows") { nav.navigate(libRoute(l)) } }
+                          libs.firstOrNull { it.type == "movie" }?.let { l -> PillButton("Movies") { nav.navigate(libRoute(l)) } }
+                          if (libs.isNotEmpty()) Box {
+                              PillButton("Libraries ▾") { menu = true }
+                              DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                  libs.forEach { l ->
+                                      DropdownMenuItem(text = { Text(l.title) }, onClick = {
+                                          menu = false
+                                          nav.navigate(libRoute(l))
+                                      })
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  if (f != null) {
+                      Column(
+                          Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(16.dp),
+                          horizontalAlignment = Alignment.CenterHorizontally,
+                      ) {
+                          Text(
+                              f.heading,
+                              style = MaterialTheme.typography.headlineMedium,
+                              fontWeight = FontWeight.Bold,
+                              textAlign = TextAlign.Center,
+                              maxLines = 2,
+                              overflow = TextOverflow.Ellipsis,
+                          )
+                          val meta = listOfNotNull(
+                              f.year.takeIf { it > 0 }?.toString(),
+                              f.contentRating,
+                              f.genres.take(3).joinToString(" · ").ifEmpty { null },
+                          ).joinToString(" · ")
+                          if (meta.isNotEmpty()) Text(meta, color = Color(0xFFDDDDDD), style = MaterialTheme.typography.bodySmall)
+                          Spacer(Modifier.height(14.dp))
+                          Row(horizontalArrangement = Arrangement.spacedBy(20.dp), verticalAlignment = Alignment.CenterVertically) {
+                              if (Watchlist.supports(f)) {
+                                  ActionIcon(if (Watchlist.has(f.guid)) Icons.Default.Check else Icons.Default.Add, "My List") {
+                                      scope.launch { Watchlist.toggle(f) }
+                                  }
+                              }
+                              Button(
+                                  onClick = { if (f.playable) ctx.play(f, true) else nav.openItem(f) },
+                                  colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
+                                  shape = RoundedCornerShape(6.dp),
+                              ) {
+                                  Icon(Icons.Default.PlayArrow, null)
+                                  Spacer(Modifier.width(4.dp))
+                                  Text(if (f.playable) "Play" else "Watch", fontWeight = FontWeight.Bold)
+                              }
+                              ActionIcon(Icons.Default.Info, "Info") { nav.openItem(f) }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun LibraryScreen(nav: NavController, key: String, type: String, title: String) {
+              var tab by rememberSaveable { mutableIntStateOf(0) }
+              Column(Modifier.fillMaxSize()) {
+                  ScreenTitle(title, onBack = { nav.popBackStack() })
+                  TabRow(selectedTabIndex = tab, containerColor = Bg, contentColor = Color.White) {
+                      Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("For You") })
+                      Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Browse All") })
+                  }
+                  if (tab == 0) SectionHubs(nav, key) else LibraryGrid(nav, key, type)
+              }
+          }
+
+          @Composable
+          private fun SectionHubs(nav: NavController, key: String) {
+              var hubs by remember { mutableStateOf<List<Hub>?>(null) }
+              var error by remember { mutableStateOf<String?>(null) }
+              var retry by remember { mutableIntStateOf(0) }
+              LaunchedEffect(key, retry) {
+                  try {
+                      hubs = Plex.sectionHubs(key)
+                      error = null
+                  } catch (e: Exception) {
+                      error = e.message
+                  }
+              }
+              val h = hubs
+              val err = error
+              when {
+                  h == null && err != null -> Message("Couldn't load this library.\n$err") { Button(onClick = { retry++ }) { Text("Retry") } }
+                  h == null -> Loading()
+                  else -> LazyColumn(Modifier.fillMaxSize()) {
+                      items(h) { hub -> HubRow(hub, nav) }
+                      item { Spacer(Modifier.height(24.dp)) }
+                  }
+              }
+          }
+
+          private val SORTS = listOf(
+              "titleSort" to "Title",
+              "addedAt:desc" to "Recently Added",
+              "originallyAvailableAt:desc" to "Release Date",
+              "audienceRating:desc" to "Rating",
+              "lastViewedAt:desc" to "Last Watched",
+              "random" to "Shuffle",
+          )
+
+          @Composable
+          private fun LibraryGrid(nav: NavController, key: String, type: String) {
+              val scope = rememberCoroutineScope()
+              var sort by rememberSaveable { mutableStateOf("titleSort") }
+              var genre by remember { mutableStateOf<Tag?>(null) }
+              var unwatched by rememberSaveable { mutableStateOf(false) }
+              var genres by remember { mutableStateOf<List<Tag>>(emptyList()) }
+              val list = remember { mutableStateListOf<Item>() }
+              var total by remember { mutableIntStateOf(-1) }
+              var loading by remember { mutableStateOf(false) }
+              var gen by remember { mutableIntStateOf(0) }
+              var sortMenu by remember { mutableStateOf(false) }
+              var genreMenu by remember { mutableStateOf(false) }
+
+              LaunchedEffect(key) { genres = runCatching { Plex.genres(key, type) }.getOrDefault(emptyList()) }
+
+              fun loadMore() {
+                  if (loading || (total >= 0 && list.size >= total)) return
+                  loading = true
+                  val g = gen
+                  scope.launch {
+                      try {
+                          val (page, t) = Plex.browse(key, type, sort, genre?.id, unwatched, list.size, 60)
+                          if (g != gen) return@launch
+                          list.addAll(page)
+                          total = if (page.isEmpty()) list.size else if (t >= 0) t else Int.MAX_VALUE
+                      } catch (e: Exception) {
+                          if (g == gen) total = list.size
+                      } finally {
+                          if (g == gen) loading = false
+                      }
+                  }
+              }
+
+              LaunchedEffect(sort, genre, unwatched) {
+                  gen++
+                  list.clear()
+                  total = -1
+                  loading = false
+                  loadMore()
+              }
+
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
+                      horizontalArrangement = Arrangement.spacedBy(8.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                      Box {
+                          FilterChip(
+                              selected = false,
+                              onClick = { sortMenu = true },
+                              label = { Text(SORTS.firstOrNull { it.first == sort }?.second ?: "Sort") },
+                              trailingIcon = { Icon(Icons.Default.ArrowDropDown, null) },
+                          )
+                          DropdownMenu(expanded = sortMenu, onDismissRequest = { sortMenu = false }) {
+                              SORTS.forEach { (k, l) ->
+                                  DropdownMenuItem(text = { Text(l) }, onClick = {
+                                      sort = k
+                                      sortMenu = false
+                                  })
+                              }
+                          }
+                      }
+                      if (genres.isNotEmpty()) Box {
+                          FilterChip(
+                              selected = genre != null,
+                              onClick = { genreMenu = true },
+                              label = { Text(genre?.title ?: "Genre") },
+                              trailingIcon = { Icon(Icons.Default.ArrowDropDown, null) },
+                          )
+                          DropdownMenu(expanded = genreMenu, onDismissRequest = { genreMenu = false }, modifier = Modifier.heightIn(max = 420.dp)) {
+                              DropdownMenuItem(text = { Text("All genres") }, onClick = {
+                                  genre = null
+                                  genreMenu = false
+                              })
+                              genres.forEach { g ->
+                                  DropdownMenuItem(text = { Text(g.title) }, onClick = {
+                                      genre = g
+                                      genreMenu = false
+                                  })
+                              }
+                          }
+                      }
+                      FilterChip(selected = unwatched, onClick = { unwatched = !unwatched }, label = { Text("Unwatched") })
+                      if (total in 1 until Int.MAX_VALUE) Text("$total titles", color = Muted, style = MaterialTheme.typography.labelMedium)
+                  }
+                  if (list.isEmpty() && !loading && total == 0) {
+                      Message("Nothing matches these filters.")
+                  } else {
+                      LazyVerticalGrid(
+                          GridCells.Adaptive(108.dp),
+                          Modifier.fillMaxSize(),
+                          contentPadding = PaddingValues(12.dp),
+                          horizontalArrangement = Arrangement.spacedBy(8.dp),
+                          verticalArrangement = Arrangement.spacedBy(12.dp),
+                      ) {
+                          itemsIndexed(list) { i, x ->
+                              if (i >= list.size - 15) LaunchedEffect(list.size) { loadMore() }
+                              PosterCard(x, Modifier.fillMaxWidth(), showTitle = true) { nav.openItem(x) }
+                          }
+                          if (loading) item(span = { GridItemSpan(maxLineSpan) }) {
+                              Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Accent) }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun SearchScreen(nav: NavController) {
+              var query by rememberSaveable { mutableStateOf("") }
+              var results by remember { mutableStateOf<List<Hub>>(emptyList()) }
+              var loading by remember { mutableStateOf(false) }
+              LaunchedEffect(query) {
+                  loading = false
+                  val q = query.trim()
+                  if (q.length < 2) {
+                      results = emptyList()
+                      return@LaunchedEffect
+                  }
+                  delay(350)
+                  loading = true
+                  results = runCatching { Plex.search(q) }.getOrDefault(emptyList())
+                  loading = false
+              }
+              Column(Modifier.fillMaxSize().statusBarsPadding()) {
+                  OutlinedTextField(
+                      query, { query = it },
+                      modifier = Modifier.fillMaxWidth().padding(12.dp),
+                      placeholder = { Text("Search movies, shows, episodes") },
+                      leadingIcon = { Icon(Icons.Default.Search, null) },
+                      trailingIcon = {
+                          if (query.isNotEmpty()) IconButton(onClick = { query = "" }) { Icon(Icons.Default.Close, "Clear") }
+                      },
+                      singleLine = true,
+                      shape = RoundedCornerShape(8.dp),
+                  )
+                  val q = query.trim()
+                  when {
+                      q.length < 2 -> SearchSuggestions(nav)
+                      loading && results.isEmpty() -> Loading()
+                      results.isEmpty() -> Message("No results for \"$q\"")
+                      else -> LazyColumn(Modifier.fillMaxSize()) {
+                          items(results) { h -> HubRow(h, nav) }
+                          item { Spacer(Modifier.height(24.dp)) }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun SearchSuggestions(nav: NavController) {
+              val libs = Cache.libs
+              LazyColumn(Modifier.fillMaxSize()) {
+                  item { Text("Browse", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.padding(16.dp)) }
+                  items(libs) { l ->
+                      Row(
+                          Modifier.fillMaxWidth().clickable { nav.navigate(libRoute(l)) }.padding(horizontal = 16.dp, vertical = 14.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                          Icon(if (l.type == "show") Icons.Default.Tv else Icons.Default.Movie, null, tint = Accent)
+                          Spacer(Modifier.width(14.dp))
+                          Text(l.title)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun MyListScreen(nav: NavController) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var opening by remember { mutableStateOf(false) }
+              OnResume { scope.launch { Watchlist.refresh() } }
+              Column(Modifier.fillMaxSize()) {
+                  ScreenTitle("My List")
+                  val list = Watchlist.items
+                  when {
+                      !Watchlist.loaded -> Loading()
+                      list.isEmpty() -> Message("Your list is empty.\nTap + My List on any movie or show to save it here.")
+                      else -> LazyVerticalGrid(
+                          GridCells.Adaptive(108.dp),
+                          Modifier.fillMaxSize(),
+                          contentPadding = PaddingValues(12.dp),
+                          horizontalArrangement = Arrangement.spacedBy(8.dp),
+                          verticalArrangement = Arrangement.spacedBy(12.dp),
+                      ) {
+                          items(list) { x ->
+                              PosterCard(x, Modifier.fillMaxWidth(), showTitle = true, onLongClick = {
+                                  scope.launch { Watchlist.toggle(x); ctx.toast("Removed ${x.title}") }
+                              }) {
+                                  val g = x.guid
+                                  if (!opening && g != null) {
+                                      opening = true
+                                      scope.launch {
+                                          val local = Plex.findOnServer(g, x.title, x.year)
+                                          opening = false
+                                          if (local != null) nav.navigate("detail/${local.ratingKey}")
+                                          else ctx.toast("${x.title} isn't on ${Plex.prefs.serverName ?: "your server"} yet")
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/java/com/feynos/plex"
+          cat > "app/src/main/java/com/feynos/plex/Main.kt" <<'FEYNOS_EOF'
+          @file:OptIn(ExperimentalMaterial3Api::class)
+
+          package com.feynos.plex
+
+          import android.Manifest
+          import android.app.Application
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.navigation.NavGraph.Companion.findStartDestination
+          import androidx.navigation.compose.NavHost
+          import androidx.navigation.compose.composable
+          import androidx.navigation.compose.currentBackStackEntryAsState
+          import androidx.navigation.compose.rememberNavController
+
+          class FeynosApp : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  Plex.init(this)
+                  Downloads.load()
+              }
+          }
+
+          enum class Stage { Login, Profiles, Servers, Main }
+
+          object Session {
+              var stage by mutableStateOf(Stage.Login)
+
+              fun refresh() {
+                  val p = Plex.prefs
+                  stage = when {
+                      p.accountToken == null -> Stage.Login
+                      p.userToken == null -> Stage.Profiles
+                      p.serverUri == null -> Stage.Servers
+                      else -> Stage.Main
+                  }
+              }
+
+              suspend fun signedIn(token: String) {
+                  val p = Plex.prefs
+                  p.accountToken = token
+                  runCatching {
+                      val a = Plex.account(token)
+                      p.userTitle = a.s("title") ?: a.s("username")
+                      p.userThumb = a.s("thumb")
+                  }
+                  val users = runCatching { Plex.homeUsers() }.getOrDefault(emptyList())
+                  if (users.size <= 1) p.userToken = token
+                  refresh()
+              }
+
+              fun switchProfile() {
+                  val p = Plex.prefs
+                  p.userToken = null
+                  p.serverUri = null
+                  p.serverToken = null
+                  Cache.clear()
+                  Watchlist.items = emptyList()
+                  refresh()
+              }
+
+              fun switchServer() {
+                  Plex.prefs.serverUri = null
+                  Plex.prefs.serverToken = null
+                  Cache.clear()
+                  refresh()
+              }
+
+              fun signOut() {
+                  val p = Plex.prefs
+                  p.accountToken = null
+                  p.userToken = null
+                  p.userTitle = null
+                  p.userThumb = null
+                  p.serverUri = null
+                  p.serverToken = null
+                  p.serverName = null
+                  Cache.clear()
+                  Watchlist.items = emptyList()
+                  refresh()
+              }
+          }
+
+          object Cache {
+              var hubs by mutableStateOf<List<Hub>?>(null)
+              var libs by mutableStateOf<List<Library>>(emptyList())
+              fun clear() {
+                  hubs = null
+                  libs = emptyList()
+              }
+          }
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge()
+                  Session.refresh()
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  setContent {
+                      FeynosTheme {
+                          Surface(Modifier.fillMaxSize(), color = Bg) { Root() }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun Root() {
+              when (Session.stage) {
+                  Stage.Login -> LoginScreen()
+                  Stage.Profiles -> ProfileScreen()
+                  Stage.Servers -> ServerScreen()
+                  Stage.Main -> MainScreen()
+              }
+          }
+
+          private data class NavTab(val route: String, val label: String, val icon: ImageVector)
+
+          @Composable
+          fun MainScreen() {
+              val nav = rememberNavController()
+              val entry by nav.currentBackStackEntryAsState()
+              val route = entry?.destination?.route
+              var update by remember { mutableStateOf<Updater.Release?>(null) }
+
+              LaunchedEffect(Unit) {
+                  Watchlist.refresh()
+                  update = Updater.check()
+              }
+
+              val tabs = listOf(
+                  NavTab("home", "Home", Icons.Default.Home),
+                  NavTab("search", "Search", Icons.Default.Search),
+                  NavTab("mylist", "My List", Icons.Default.Bookmark),
+                  NavTab("downloads", "Downloads", Icons.Default.Download),
+                  NavTab("more", "More", Icons.Default.Menu),
+              )
+
+              Scaffold(
+                  containerColor = Bg,
+                  contentWindowInsets = WindowInsets(0, 0, 0, 0),
+                  bottomBar = {
+                      NavigationBar(containerColor = Color(0xFF111111)) {
+                          tabs.forEach { t ->
+                              NavigationBarItem(
+                                  selected = route == t.route,
+                                  onClick = {
+                                      nav.navigate(t.route) {
+                                          popUpTo(nav.graph.findStartDestination().id) { saveState = true }
+                                          launchSingleTop = true
+                                          restoreState = true
+                                      }
+                                  },
+                                  icon = { Icon(t.icon, contentDescription = t.label) },
+                                  label = { Text(t.label) },
+                                  colors = NavigationBarItemDefaults.colors(
+                                      selectedIconColor = Color.White,
+                                      selectedTextColor = Color.White,
+                                      indicatorColor = Color(0xFF333333),
+                                      unselectedIconColor = Muted,
+                                      unselectedTextColor = Muted,
+                                  ),
+                              )
+                          }
+                      }
+                  },
+              ) { pad ->
+                  NavHost(nav, startDestination = "home", modifier = Modifier.fillMaxSize().padding(pad)) {
+                      composable("home") { HomeScreen(nav) }
+                      composable("search") { SearchScreen(nav) }
+                      composable("mylist") { MyListScreen(nav) }
+                      composable("downloads") { DownloadsScreen() }
+                      composable("more") { MoreScreen() }
+                      composable("library/{key}/{type}/{title}") { e ->
+                          val a = e.arguments
+                          LibraryScreen(nav, a?.getString("key") ?: "", a?.getString("type") ?: "movie", a?.getString("title") ?: "")
+                      }
+                      composable("detail/{rk}") { e -> DetailScreen(nav, e.arguments?.getString("rk") ?: "") }
+                  }
+              }
+
+              update?.let { r -> UpdateDialog(r) { update = null } }
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/java/com/feynos/plex"
+          cat > "app/src/main/java/com/feynos/plex/Models.kt" <<'FEYNOS_EOF'
+          package com.feynos.plex
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          fun JSONObject.s(k: String): String? = if (has(k) && !isNull(k)) optString(k).takeIf { it.isNotEmpty() } else null
+          fun JSONArray?.objs(): List<JSONObject> = if (this == null) emptyList() else (0 until length()).mapNotNull { optJSONObject(it) }
+          fun JSONObject.tags(k: String): List<String> = optJSONArray(k).objs().mapNotNull { it.s("tag") }
+          fun JSONObject.metadata(): List<Item> = optJSONArray("Metadata").objs().map { Item.parse(it) }
+          fun JSONObject.hubs(): List<Hub> = optJSONArray("Hub").objs().map { Hub.parse(it) }
+
+          data class Stream(
+              val id: Long,
+              val type: Int,
+              val title: String,
+              val language: String?,
+              val codec: String?,
+              val key: String?,
+              val selected: Boolean,
+              val forced: Boolean,
+          ) {
+              companion object {
+                  fun parse(o: JSONObject) = Stream(
+                      id = o.optLong("id"),
+                      type = o.optInt("streamType"),
+                      title = o.s("extendedDisplayTitle") ?: o.s("displayTitle") ?: o.s("title") ?: o.s("language") ?: "Track",
+                      language = o.s("languageCode") ?: o.s("languageTag"),
+                      codec = o.s("codec"),
+                      key = o.s("key"),
+                      selected = o.optBoolean("selected") || o.optInt("selected") == 1,
+                      forced = o.optBoolean("forced") || o.optInt("forced") == 1,
+                  )
+              }
+          }
+
+          data class Part(val id: Long, val key: String, val file: String?, val size: Long, val container: String?, val streams: List<Stream>) {
+              companion object {
+                  fun parse(o: JSONObject) = Part(
+                      id = o.optLong("id"),
+                      key = o.s("key") ?: "",
+                      file = o.s("file"),
+                      size = o.optLong("size"),
+                      container = o.s("container"),
+                      streams = o.optJSONArray("Stream").objs().map { Stream.parse(it) },
+                  )
+              }
+          }
+
+          data class Media(
+              val videoResolution: String?,
+              val videoCodec: String?,
+              val audioCodec: String?,
+              val audioChannels: Int,
+              val bitrate: Int,
+              val container: String?,
+              val parts: List<Part>,
+          ) {
+              companion object {
+                  fun parse(o: JSONObject) = Media(
+                      videoResolution = o.s("videoResolution"),
+                      videoCodec = o.s("videoCodec"),
+                      audioCodec = o.s("audioCodec"),
+                      audioChannels = o.optInt("audioChannels"),
+                      bitrate = o.optInt("bitrate"),
+                      container = o.s("container"),
+                      parts = o.optJSONArray("Part").objs().map { Part.parse(it) },
+                  )
+              }
+          }
+
+          data class Marker(val type: String, val start: Long, val end: Long, val final: Boolean)
+          data class Person(val name: String, val role: String?, val thumb: String?)
+          data class Library(val key: String, val title: String, val type: String)
+          data class Tag(val id: String, val title: String)
+
+          data class Item(
+              val ratingKey: String,
+              val key: String?,
+              val type: String,
+              val title: String,
+              val summary: String?,
+              val tagline: String?,
+              val year: Int,
+              val thumb: String?,
+              val art: String?,
+              val parentThumb: String?,
+              val grandparentThumb: String?,
+              val grandparentArt: String?,
+              val grandparentTitle: String?,
+              val parentTitle: String?,
+              val grandparentRatingKey: String?,
+              val parentRatingKey: String?,
+              val index: Int,
+              val parentIndex: Int,
+              val duration: Long,
+              val viewOffset: Long,
+              val viewCount: Int,
+              val leafCount: Int,
+              val viewedLeafCount: Int,
+              val childCount: Int,
+              val contentRating: String?,
+              val audienceRating: Double,
+              val rating: Double,
+              val studio: String?,
+              val released: String?,
+              val guid: String?,
+              val subtype: String?,
+              val genres: List<String>,
+              val directors: List<String>,
+              val writers: List<String>,
+              val cast: List<Person>,
+              val media: List<Media>,
+              val markers: List<Marker>,
+              val extras: List<Item>,
+              val related: List<Hub>,
+              val onDeck: Item?,
+          ) {
+              val isWatched: Boolean
+                  get() = if (type == "show" || type == "season") leafCount > 0 && viewedLeafCount >= leafCount else viewCount > 0
+
+              val progress: Float
+                  get() = if (duration > 0 && viewOffset > 0) (viewOffset.toFloat() / duration).coerceIn(0f, 1f) else 0f
+
+              val poster: String?
+                  get() = when (type) {
+                      "episode" -> grandparentThumb ?: parentThumb ?: thumb
+                      "season" -> thumb ?: parentThumb
+                      else -> thumb
+                  }
+
+              val backdrop: String? get() = art ?: grandparentArt ?: thumb
+              val wideImage: String? get() = if (type == "episode") thumb ?: art ?: grandparentArt else art ?: thumb
+              val epLabel: String get() = if (type == "episode") "S$parentIndex:E$index" else ""
+              val heading: String get() = if (type == "episode") grandparentTitle ?: title else if (type == "season") parentTitle ?: title else title
+              val subheading: String
+                  get() = when (type) {
+                      "episode" -> "$epLabel · $title"
+                      "season" -> title
+                      else -> if (year > 0) "$year" else ""
+                  }
+              val playable: Boolean get() = type == "movie" || type == "episode" || type == "clip"
+
+              companion object {
+                  fun parse(o: JSONObject): Item {
+                      val od = o.optJSONObject("OnDeck")
+                      val odm = od?.optJSONObject("Metadata") ?: od?.optJSONArray("Metadata")?.optJSONObject(0)
+                      return Item(
+                          ratingKey = o.s("ratingKey") ?: "",
+                          key = o.s("key"),
+                          type = o.s("type") ?: "",
+                          title = o.s("title") ?: "",
+                          summary = o.s("summary"),
+                          tagline = o.s("tagline"),
+                          year = o.optInt("year"),
+                          thumb = o.s("thumb"),
+                          art = o.s("art"),
+                          parentThumb = o.s("parentThumb"),
+                          grandparentThumb = o.s("grandparentThumb"),
+                          grandparentArt = o.s("grandparentArt"),
+                          grandparentTitle = o.s("grandparentTitle"),
+                          parentTitle = o.s("parentTitle"),
+                          grandparentRatingKey = o.s("grandparentRatingKey"),
+                          parentRatingKey = o.s("parentRatingKey"),
+                          index = o.optInt("index"),
+                          parentIndex = o.optInt("parentIndex"),
+                          duration = o.optLong("duration"),
+                          viewOffset = o.optLong("viewOffset"),
+                          viewCount = o.optInt("viewCount"),
+                          leafCount = o.optInt("leafCount"),
+                          viewedLeafCount = o.optInt("viewedLeafCount"),
+                          childCount = o.optInt("childCount"),
+                          contentRating = o.s("contentRating"),
+                          audienceRating = o.optDouble("audienceRating", 0.0).let { if (it.isNaN()) 0.0 else it },
+                          rating = o.optDouble("rating", 0.0).let { if (it.isNaN()) 0.0 else it },
+                          studio = o.s("studio"),
+                          released = o.s("originallyAvailableAt"),
+                          guid = o.s("guid"),
+                          subtype = o.s("subtype"),
+                          genres = o.tags("Genre"),
+                          directors = o.tags("Director"),
+                          writers = o.tags("Writer"),
+                          cast = o.optJSONArray("Role").objs().map { Person(it.s("tag") ?: "", it.s("role"), it.s("thumb")) },
+                          media = o.optJSONArray("Media").objs().map { Media.parse(it) },
+                          markers = o.optJSONArray("Marker").objs().map {
+                              Marker(it.s("type") ?: "", it.optLong("startTimeOffset"), it.optLong("endTimeOffset"), it.optBoolean("final"))
+                          },
+                          extras = o.optJSONObject("Extras")?.metadata() ?: emptyList(),
+                          related = o.optJSONObject("Related")?.hubs() ?: emptyList(),
+                          onDeck = odm?.let { parse(it) },
+                      )
+                  }
+              }
+          }
+
+          data class Hub(val title: String, val identifier: String, val key: String?, val type: String?, val items: List<Item>, val more: Boolean) {
+              val isContinue: Boolean get() = identifier.contains("continue") || identifier.contains("ondeck")
+
+              companion object {
+                  fun parse(o: JSONObject) = Hub(
+                      title = o.s("title") ?: "",
+                      identifier = o.s("hubIdentifier") ?: "",
+                      key = o.s("key"),
+                      type = o.s("type"),
+                      items = o.metadata(),
+                      more = o.optBoolean("more"),
+                  )
+              }
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/java/com/feynos/plex"
+          cat > "app/src/main/java/com/feynos/plex/Onboarding.kt" <<'FEYNOS_EOF'
+          @file:OptIn(ExperimentalMaterial3Api::class)
+
+          package com.feynos.plex
+
+          import android.content.Intent
+          import android.net.Uri
+          import androidx.compose.foundation.*
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.*
+          import androidx.compose.foundation.lazy.grid.*
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import coil.compose.AsyncImage
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+
+          @Composable
+          fun LoginScreen() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var pin by remember { mutableStateOf<Pin?>(null) }
+              var error by remember { mutableStateOf<String?>(null) }
+              var passwordMode by remember { mutableStateOf(false) }
+              var busy by remember { mutableStateOf(false) }
+              var email by remember { mutableStateOf("") }
+              var password by remember { mutableStateOf("") }
+              var code by remember { mutableStateOf("") }
+              var attempt by remember { mutableIntStateOf(0) }
+
+              LaunchedEffect(attempt) {
+                  pin = null
+                  error = null
+                  val p = try {
+                      Plex.createPin()
+                  } catch (e: Exception) {
+                      error = "Can't reach plex.tv (${e.message})"
+                      return@LaunchedEffect
+                  }
+                  pin = p
+                  repeat(150) {
+                      delay(2000)
+                      val token = runCatching { Plex.pinToken(p.id) }.getOrNull()
+                      if (token != null) {
+                          Session.signedIn(token)
+                          return@LaunchedEffect
+                      }
+                  }
+                  attempt++
+              }
+
+              Column(
+                  Modifier.fillMaxSize().systemBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(24.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally,
+                  verticalArrangement = Arrangement.Center,
+              ) {
+                  Spacer(Modifier.height(40.dp))
+                  Logo(40)
+                  Spacer(Modifier.height(40.dp))
+                  if (!passwordMode) {
+                      Text("Sign in with Plex", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                      Spacer(Modifier.height(8.dp))
+                      Text("On any device, go to plex.tv/link and enter:", color = Muted, textAlign = TextAlign.Center)
+                      Spacer(Modifier.height(16.dp))
+                      Text(
+                          pin?.code ?: "····",
+                          fontSize = 46.sp,
+                          letterSpacing = 10.sp,
+                          fontWeight = FontWeight.Bold,
+                          color = Accent,
+                      )
+                      Spacer(Modifier.height(20.dp))
+                      Button(
+                          enabled = pin != null,
+                          onClick = { pin?.let { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(Plex.linkUrl(it.code)))) } },
+                          modifier = Modifier.fillMaxWidth().height(48.dp),
+                      ) { Text("Sign in on this phone", fontWeight = FontWeight.Bold) }
+                      Spacer(Modifier.height(10.dp))
+                      if (pin != null) Text("Waiting for you to sign in…", color = Muted, style = MaterialTheme.typography.bodySmall)
+                      Spacer(Modifier.height(16.dp))
+                      TextButton(onClick = { passwordMode = true }) { Text("Use email & password instead") }
+                  } else {
+                      Text("Sign in", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                      Spacer(Modifier.height(16.dp))
+                      OutlinedTextField(
+                          email, { email = it },
+                          label = { Text("Email or username") },
+                          singleLine = true,
+                          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                          modifier = Modifier.fillMaxWidth(),
+                      )
+                      Spacer(Modifier.height(8.dp))
+                      OutlinedTextField(
+                          password, { password = it },
+                          label = { Text("Password") },
+                          singleLine = true,
+                          visualTransformation = PasswordVisualTransformation(),
+                          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                          modifier = Modifier.fillMaxWidth(),
+                      )
+                      Spacer(Modifier.height(8.dp))
+                      OutlinedTextField(
+                          code, { code = it },
+                          label = { Text("2FA code (only if enabled)") },
+                          singleLine = true,
+                          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                          modifier = Modifier.fillMaxWidth(),
+                      )
+                      Spacer(Modifier.height(16.dp))
+                      Button(
+                          enabled = !busy && email.isNotBlank() && password.isNotBlank(),
+                          onClick = {
+                              busy = true
+                              error = null
+                              scope.launch {
+                                  try {
+                                      Session.signedIn(Plex.signIn(email.trim(), password, code.trim()))
+                                  } catch (e: Exception) {
+                                      error = if (e is PlexException && (e.code == 401 || e.code == 422)) "Wrong email, password or code" else (e.message ?: "Sign in failed")
+                                  } finally {
+                                      busy = false
+                                  }
+                              }
+                          },
+                          modifier = Modifier.fillMaxWidth().height(48.dp),
+                      ) { Text(if (busy) "Signing in…" else "Sign in", fontWeight = FontWeight.Bold) }
+                      TextButton(onClick = { passwordMode = false }) { Text("Use a link code instead") }
+                  }
+                  error?.let {
+                      Spacer(Modifier.height(12.dp))
+                      Text(it, color = Danger, textAlign = TextAlign.Center)
+                      TextButton(onClick = { attempt++ }) { Text("Retry") }
+                  }
+              }
+          }
+
+          @Composable
+          fun PinDialog(name: String, error: String?, onDismiss: () -> Unit, onPin: (String) -> Unit) {
+              var pin by remember { mutableStateOf("") }
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text("Enter PIN for $name") },
+                  text = {
+                      Column {
+                          OutlinedTextField(
+                              pin,
+                              { v -> if (v.length <= 4 && v.all { it.isDigit() }) pin = v },
+                              singleLine = true,
+                              visualTransformation = PasswordVisualTransformation(),
+                              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                          )
+                          error?.let { Text(it, color = Danger, modifier = Modifier.padding(top = 8.dp)) }
+                      }
+                  },
+                  confirmButton = { TextButton(enabled = pin.length == 4, onClick = { onPin(pin) }) { Text("OK") } },
+                  dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+              )
+          }
+
+          @Composable
+          fun ProfileScreen() {
+              val scope = rememberCoroutineScope()
+              var users by remember { mutableStateOf<List<HomeUser>?>(null) }
+              var pinFor by remember { mutableStateOf<HomeUser?>(null) }
+              var error by remember { mutableStateOf<String?>(null) }
+              var busy by remember { mutableStateOf(false) }
+
+              LaunchedEffect(Unit) {
+                  val list = runCatching { Plex.homeUsers() }.getOrDefault(emptyList())
+                  if (list.size <= 1) {
+                      Plex.prefs.userToken = Plex.prefs.accountToken
+                      Session.refresh()
+                  } else users = list
+              }
+
+              fun choose(u: HomeUser, pin: String?) {
+                  busy = true
+                  error = null
+                  scope.launch {
+                      try {
+                          val t = Plex.switchUser(u, pin)
+                          val p = Plex.prefs
+                          p.userToken = t
+                          p.userTitle = u.title
+                          p.userThumb = u.thumb
+                          p.serverUri = null
+                          p.serverToken = null
+                          pinFor = null
+                          Cache.clear()
+                          Session.refresh()
+                      } catch (e: Exception) {
+                          if (pin != null || u.protected) {
+                              error = "Incorrect PIN"
+                              pinFor = u
+                          } else error = e.message ?: "Couldn't switch profile"
+                      } finally {
+                          busy = false
+                      }
+                  }
+              }
+
+              Column(
+                  Modifier.fillMaxSize().systemBarsPadding().padding(24.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally,
+              ) {
+                  Spacer(Modifier.height(32.dp))
+                  Logo()
+                  Spacer(Modifier.height(32.dp))
+                  Text("Who's watching?", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(28.dp))
+                  val list = users
+                  if (list == null) {
+                      CircularProgressIndicator(color = Accent)
+                  } else {
+                      LazyVerticalGrid(
+                          GridCells.Adaptive(120.dp),
+                          horizontalArrangement = Arrangement.spacedBy(16.dp),
+                          verticalArrangement = Arrangement.spacedBy(24.dp),
+                          modifier = Modifier.weight(1f),
+                      ) {
+                          items(list) { u ->
+                              Column(
+                                  Modifier.clip(RoundedCornerShape(10.dp)).clickable(enabled = !busy) {
+                                      if (u.protected) pinFor = u else choose(u, null)
+                                  }.padding(6.dp),
+                                  horizontalAlignment = Alignment.CenterHorizontally,
+                              ) {
+                                  AsyncImage(
+                                      model = u.thumb,
+                                      contentDescription = null,
+                                      contentScale = ContentScale.Crop,
+                                      modifier = Modifier.size(96.dp).clip(RoundedCornerShape(10.dp)).background(Color(0xFF333333)),
+                                  )
+                                  Spacer(Modifier.height(8.dp))
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Text(u.title, maxLines = 1)
+                                      if (u.protected) {
+                                          Spacer(Modifier.width(4.dp))
+                                          Icon(Icons.Default.Lock, null, Modifier.size(14.dp), tint = Muted)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  if (pinFor == null) error?.let { Text(it, color = Danger) }
+                  TextButton(onClick = { Session.signOut() }) { Text("Sign out") }
+              }
+
+              pinFor?.let { u ->
+                  PinDialog(u.title, error, onDismiss = { pinFor = null; error = null }) { p -> choose(u, p) }
+              }
+          }
+
+          @Composable
+          fun ServerScreen() {
+              val scope = rememberCoroutineScope()
+              var servers by remember { mutableStateOf<List<Server>?>(null) }
+              var connecting by remember { mutableStateOf<String?>(null) }
+              var error by remember { mutableStateOf<String?>(null) }
+              var custom by remember { mutableStateOf("") }
+
+              fun use(name: String, id: String?, uri: String, token: String?) {
+                  val p = Plex.prefs
+                  p.serverName = name
+                  p.serverId = id
+                  p.serverToken = token
+                  p.serverUri = uri
+                  Cache.clear()
+                  Session.refresh()
+              }
+
+              fun connect(s: Server) {
+                  connecting = s.name
+                  error = null
+                  scope.launch {
+                      val uri = Plex.connect(s)
+                      if (uri == null) {
+                          error = "Couldn't reach ${s.name}. Make sure it's online."
+                          connecting = null
+                      } else use(s.name, s.id, uri, s.token)
+                  }
+              }
+
+              fun connectCustom() {
+                  val url = custom.trim().trimEnd('/').let { if (it.startsWith("http")) it else "http://$it" }
+                  connecting = url
+                  error = null
+                  scope.launch {
+                      try {
+                          val id = Plex.probe(url, Plex.prefs.userToken)
+                          val match = servers?.firstOrNull { it.id == id }
+                          use(match?.name ?: url, id, url, match?.token ?: Plex.prefs.userToken)
+                      } catch (e: Exception) {
+                          error = "Couldn't connect to $url"
+                          connecting = null
+                      }
+                  }
+              }
+
+              LaunchedEffect(Unit) {
+                  try {
+                      val list = Plex.servers()
+                      servers = list
+                      if (list.size == 1) connect(list.first())
+                  } catch (e: Exception) {
+                      servers = emptyList()
+                      error = "Couldn't load servers (${e.message})"
+                  }
+              }
+
+              Column(Modifier.fillMaxSize().systemBarsPadding().imePadding().padding(20.dp)) {
+                  Spacer(Modifier.height(24.dp))
+                  Logo()
+                  Spacer(Modifier.height(24.dp))
+                  Text("Choose a server", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(12.dp))
+                  val list = servers
+                  LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                      if (list == null) item { Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Accent) } }
+                      else if (list.isEmpty()) item { Text("No servers found on this account.", color = Muted) }
+                      else items(list) { s ->
+                          Row(
+                              Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color(0xFF1A1A1A))
+                                  .clickable(enabled = connecting == null) { connect(s) }.padding(16.dp),
+                              verticalAlignment = Alignment.CenterVertically,
+                          ) {
+                              Icon(Icons.Default.Dns, null, tint = Accent)
+                              Spacer(Modifier.width(14.dp))
+                              Column(Modifier.weight(1f)) {
+                                  Text(s.name, fontWeight = FontWeight.SemiBold)
+                                  Text(if (s.owned) "Your server" else "Shared with you", color = Muted, style = MaterialTheme.typography.bodySmall)
+                              }
+                              if (connecting == s.name) CircularProgressIndicator(Modifier.size(22.dp), color = Accent, strokeWidth = 2.dp)
+                          }
+                      }
+                      item {
+                          Spacer(Modifier.height(16.dp))
+                          Text("Or connect by address", color = Muted)
+                          Spacer(Modifier.height(6.dp))
+                          OutlinedTextField(
+                              custom, { custom = it },
+                              placeholder = { Text("https://plex.example.com or 192.168.0.25:32400") },
+                              singleLine = true,
+                              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                              modifier = Modifier.fillMaxWidth(),
+                          )
+                          Spacer(Modifier.height(8.dp))
+                          OutlinedButton(enabled = custom.isNotBlank() && connecting == null, onClick = { connectCustom() }) { Text("Connect") }
+                      }
+                  }
+                  error?.let { Text(it, color = Danger, modifier = Modifier.padding(vertical = 8.dp)) }
+                  Row {
+                      TextButton(onClick = { Session.switchProfile() }) { Text("Switch profile") }
+                      TextButton(onClick = { Session.signOut() }) { Text("Sign out") }
+                  }
+              }
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/java/com/feynos/plex"
+          cat > "app/src/main/java/com/feynos/plex/Player.kt" <<'FEYNOS_EOF'
+          package com.feynos.plex
+
+          import android.app.PictureInPictureParams
+          import android.content.Intent
+          import android.content.res.Configuration
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.SystemClock
+          import android.util.Rational
+          import android.view.View
+          import android.view.WindowManager
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material.icons.filled.HighQuality
+          import androidx.compose.material.icons.filled.PlayArrow
+          import androidx.compose.material.icons.filled.SkipNext
+          import androidx.compose.material.icons.filled.Subtitles
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsCompat
+          import androidx.core.view.WindowInsetsControllerCompat
+          import androidx.lifecycle.lifecycleScope
+          import androidx.media3.common.AudioAttributes
+          import androidx.media3.common.C
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.MimeTypes
+          import androidx.media3.common.PlaybackException
+          import androidx.media3.common.Player
+          import androidx.media3.common.util.UnstableApi
+          import androidx.media3.datasource.DefaultDataSource
+          import androidx.media3.datasource.DefaultHttpDataSource
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+          import androidx.media3.ui.PlayerView
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import java.io.File
+          import java.util.UUID
+
+          @androidx.annotation.OptIn(UnstableApi::class)
+          class PlayerActivity : ComponentActivity() {
+              private lateinit var player: ExoPlayer
+
+              private var current by mutableStateOf<Item?>(null)
+              private var next by mutableStateOf<Item?>(null)
+              private var transcoding by mutableStateOf(false)
+              private var kbps by mutableIntStateOf(0)
+              private var controlsVisible by mutableStateOf(true)
+              private var inPip by mutableStateOf(false)
+              private var position by mutableLongStateOf(0L)
+              private var duration by mutableLongStateOf(0L)
+              private var countdown by mutableIntStateOf(-1)
+              private var creditsDismissed by mutableStateOf(false)
+              private var error by mutableStateOf<String?>(null)
+              private var showStreams by mutableStateOf(false)
+              private var showQuality by mutableStateOf(false)
+              private var offlineTitle by mutableStateOf<String?>(null)
+              private var localPath by mutableStateOf<String?>(null)
+
+              private var countdownStart = 0L
+              private var skippedIntro = false
+              private var session = UUID.randomUUID().toString()
+              private var lastReport = 0L
+              private var loadJob: Job? = null
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  hideBars()
+                  kbps = Plex.prefs.quality
+
+                  val httpFactory = DefaultHttpDataSource.Factory()
+                      .setAllowCrossProtocolRedirects(true)
+                      .setConnectTimeoutMs(15_000)
+                      .setReadTimeoutMs(30_000)
+                      .setDefaultRequestProperties(Plex.headers() - "Accept")
+                  player = ExoPlayer.Builder(this)
+                      .setMediaSourceFactory(DefaultMediaSourceFactory(DefaultDataSource.Factory(this, httpFactory)))
+                      .setSeekBackIncrementMs(10_000)
+                      .setSeekForwardIncrementMs(10_000)
+                      .setAudioAttributes(
+                          AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(),
+                          true,
+                      )
+                      .setHandleAudioBecomingNoisy(true)
+                      .build()
+                  player.addListener(object : Player.Listener {
+                      override fun onPlayerError(e: PlaybackException) = handleError(e)
+                      override fun onPlaybackStateChanged(state: Int) {
+                          if (state == Player.STATE_ENDED) onEnded()
+                      }
+                      override fun onIsPlayingChanged(isPlaying: Boolean) {
+                          report(if (isPlaying) "playing" else "paused")
+                      }
+                  })
+
+                  setContent { FeynosTheme { PlayerUi() } }
+                  lifecycleScope.launch { ticker() }
+                  begin(intent)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  stopCurrent()
+                  begin(intent)
+              }
+
+              private fun hideBars() {
+                  WindowInsetsControllerCompat(window, window.decorView).let {
+                      it.hide(WindowInsetsCompat.Type.systemBars())
+                      it.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                  }
+              }
+
+              override fun onWindowFocusChanged(hasFocus: Boolean) {
+                  super.onWindowFocusChanged(hasFocus)
+                  if (hasFocus) hideBars()
+              }
+
+              private fun begin(i: Intent) {
+                  val rk = i.getStringExtra("rk")
+                  if (rk == null) {
+                      finish()
+                      return
+                  }
+                  localPath = i.getStringExtra("local")
+                  offlineTitle = Downloads.find(rk)?.let { if (it.subtitle.isNotEmpty()) "${it.title} · ${it.subtitle}" else it.title }
+                  val offset = i.getLongExtra("offset", 0L)
+                  val autoResume = i.getBooleanExtra("autoResume", false)
+                  current = null
+                  next = null
+                  error = null
+                  countdown = -1
+                  transcoding = false
+                  loadJob?.cancel()
+                  loadJob = lifecycleScope.launch {
+                      val meta = try {
+                          Plex.metadata(rk)
+                      } catch (e: Exception) {
+                          if (localPath == null) {
+                              error = "Couldn't load this title (${e.message})"
+                              return@launch
+                          }
+                          null
+                      }
+                      if (meta == null && localPath == null) {
+                          error = "This title isn't on the server anymore."
+                          return@launch
+                      }
+                      current = meta
+                      val start = if (autoResume && offset == 0L) (meta?.viewOffset ?: 0L) else offset
+                      startPlayback(start)
+                      if (meta != null && meta.type == "episode") next = findNext(meta)
+                  }
+              }
+
+              private suspend fun findNext(m: Item): Item? {
+                  val show = m.grandparentRatingKey ?: return null
+                  return runCatching {
+                      val leaves = Plex.allLeaves(show)
+                      val i = leaves.indexOfFirst { it.ratingKey == m.ratingKey }
+                      if (i >= 0) leaves.getOrNull(i + 1) else null
+                  }.getOrNull()
+              }
+
+              private fun subMime(codec: String?): String? = when (codec?.lowercase()) {
+                  "srt", "subrip" -> MimeTypes.APPLICATION_SUBRIP
+                  "ass", "ssa" -> MimeTypes.TEXT_SSA
+                  "vtt", "webvtt" -> MimeTypes.TEXT_VTT
+                  else -> null
+              }
+
+              private fun startPlayback(startMs: Long) {
+                  val m = current
+                  val local = localPath
+                  val mediaItem: MediaItem
+                  if (local != null) {
+                      transcoding = false
+                      mediaItem = MediaItem.fromUri(Uri.fromFile(File(local)))
+                  } else {
+                      if (m == null) return
+                      val part = m.media.firstOrNull()?.parts?.firstOrNull()
+                      if (part == null || transcoding || kbps > 0) {
+                          transcoding = true
+                          session = UUID.randomUUID().toString()
+                          mediaItem = MediaItem.Builder()
+                              .setUri(Plex.transcodeUrl(m.ratingKey, session, if (kbps > 0) kbps else 20000))
+                              .setMimeType(MimeTypes.APPLICATION_M3U8)
+                              .build()
+                      } else {
+                          val subs = part.streams.filter { it.type == 3 && it.key != null }.mapNotNull { s ->
+                              val mime = subMime(s.codec) ?: return@mapNotNull null
+                              MediaItem.SubtitleConfiguration.Builder(Uri.parse(Plex.streamUrl(s.key!!)))
+                                  .setMimeType(mime)
+                                  .setLanguage(s.language)
+                                  .setLabel(s.title)
+                                  .setSelectionFlags(if (s.selected) C.SELECTION_FLAG_DEFAULT else 0)
+                                  .build()
+                          }
+                          mediaItem = MediaItem.Builder().setUri(Plex.directUrl(part)).setSubtitleConfigurations(subs).build()
+                          val audioLang = part.streams.firstOrNull { it.type == 2 && it.selected }?.language
+                          val sub = part.streams.firstOrNull { it.type == 3 && it.selected }
+                          player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                              .setPreferredAudioLanguage(audioLang)
+                              .setPreferredTextLanguage(sub?.language)
+                              .build()
+                      }
+                  }
+                  skippedIntro = false
+                  creditsDismissed = false
+                  countdown = -1
+                  error = null
+                  player.setMediaItem(mediaItem, startMs)
+                  player.prepare()
+                  player.playWhenReady = true
+              }
+
+              private fun handleError(e: PlaybackException) {
+                  if (!transcoding && localPath == null && current != null) {
+                      toast("Can't play this file directly — transcoding instead")
+                      val pos = player.currentPosition
+                      transcoding = true
+                      startPlayback(pos)
+                  } else {
+                      error = "Playback error: ${e.errorCodeName}"
+                  }
+              }
+
+              private fun onEnded() {
+                  report("stopped")
+                  if (next != null && Plex.prefs.autoplayNext) playNext() else finish()
+              }
+
+              private fun stopCurrent() {
+                  report("stopped")
+                  if (transcoding) {
+                      val s = session
+                      Plex.bg.launch { Plex.stopTranscode(s) }
+                  }
+              }
+
+              private fun playNext() {
+                  val n = next ?: return
+                  player.pause()
+                  stopCurrent()
+                  next = null
+                  countdown = -1
+                  val local = Downloads.find(n.ratingKey)?.takeIf { Downloads.isComplete(this, it) }
+                  loadJob?.cancel()
+                  loadJob = lifecycleScope.launch {
+                      val meta = runCatching { Plex.metadata(n.ratingKey) }.getOrNull() ?: n
+                      current = meta
+                      localPath = local?.file
+                      transcoding = false
+                      startPlayback(0)
+                      if (meta.type == "episode") next = findNext(meta)
+                  }
+              }
+
+              private fun restartAt(pos: Long) {
+                  if (transcoding) {
+                      val s = session
+                      Plex.bg.launch { Plex.stopTranscode(s) }
+                  }
+                  startPlayback(pos)
+              }
+
+              private fun report(state: String) {
+                  val m = current ?: return
+                  lastReport = SystemClock.elapsedRealtime()
+                  val pos = player.currentPosition
+                  val dur = player.duration.takeIf { it > 0 } ?: m.duration
+                  Plex.bg.launch { Plex.timeline(m.ratingKey, state, pos, dur) }
+              }
+
+              private fun inCredits(m: Item): Boolean {
+                  if (duration <= 0) return false
+                  val credits = m.markers.filter { it.type == "credits" }
+                  val fin = credits.firstOrNull { it.final } ?: credits.lastOrNull()
+                  return if (fin != null) position >= fin.start && position < duration
+                  else m.type == "episode" && (duration - position).let { it in 1L..20_000L }
+              }
+
+              private suspend fun ticker() {
+                  while (true) {
+                      delay(500)
+                      position = player.currentPosition
+                      duration = player.duration.let { if (it == C.TIME_UNSET || it < 0) 0L else it }
+                      val m = current ?: continue
+                      if (player.isPlaying && SystemClock.elapsedRealtime() - lastReport > 10_000) report("playing")
+
+                      val intro = m.markers.firstOrNull { it.type == "intro" && position >= it.start && position < it.end }
+                      if (intro != null && Plex.prefs.autoSkipIntro && !skippedIntro) {
+                          skippedIntro = true
+                          player.seekTo(intro.end)
+                      }
+
+                      if (next != null && Plex.prefs.autoplayNext && !creditsDismissed && inCredits(m)) {
+                          if (countdown < 0) {
+                              countdown = 10
+                              countdownStart = SystemClock.elapsedRealtime()
+                          } else {
+                              if (!player.isPlaying) countdownStart += 500
+                              val left = 10 - ((SystemClock.elapsedRealtime() - countdownStart) / 1000).toInt()
+                              countdown = left.coerceAtLeast(0)
+                              if (left <= 0) playNext()
+                          }
+                      } else if (countdown >= 0) {
+                          countdown = -1
+                      }
+                  }
+              }
+
+              override fun onUserLeaveHint() {
+                  super.onUserLeaveHint()
+                  if (player.isPlaying) {
+                      runCatching {
+                          enterPictureInPictureMode(PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build())
+                      }
+                  }
+              }
+
+              override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+                  super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+                  inPip = isInPictureInPictureMode
+              }
+
+              override fun onStop() {
+                  super.onStop()
+                  player.pause()
+              }
+
+              override fun onDestroy() {
+                  stopCurrent()
+                  player.release()
+                  super.onDestroy()
+              }
+
+              // ---------------------------------------------------------------- UI
+
+              @Composable
+              private fun PlayerUi() {
+                  Box(Modifier.fillMaxSize().background(Color.Black)) {
+                      AndroidView(
+                          factory = { c ->
+                              PlayerView(c).apply {
+                                  player = this@PlayerActivity.player
+                                  setShowSubtitleButton(true)
+                                  setShowNextButton(false)
+                                  setShowPreviousButton(false)
+                                  controllerShowTimeoutMs = 3500
+                                  setControllerVisibilityListener(
+                                      PlayerView.ControllerVisibilityListener { v -> controlsVisible = v == View.VISIBLE }
+                                  )
+                              }
+                          },
+                          update = { v -> v.useController = !inPip },
+                          modifier = Modifier.fillMaxSize(),
+                      )
+
+                      if (!inPip) {
+                          val m = current
+                          val err = error
+                          if (err != null) {
+                              Column(
+                                  Modifier.align(Alignment.Center).clip(RoundedCornerShape(12.dp)).background(Color(0xE6141414)).padding(24.dp),
+                                  horizontalAlignment = Alignment.CenterHorizontally,
+                              ) {
+                                  Text(err, color = Color.White)
+                                  Spacer(Modifier.height(12.dp))
+                                  Row {
+                                      if (localPath == null && current != null) {
+                                          Button(onClick = {
+                                              transcoding = true
+                                              startPlayback(position)
+                                          }) { Text("Try transcoding") }
+                                          Spacer(Modifier.width(8.dp))
+                                      }
+                                      TextButton(onClick = { finish() }) { Text("Close") }
+                                  }
+                              }
+                          } else if (m == null && localPath == null) {
+                              CircularProgressIndicator(Modifier.align(Alignment.Center), color = Accent)
+                          }
+
+                          if (controlsVisible || err != null) TopBar(m)
+
+                          Column(
+                              Modifier.align(Alignment.BottomEnd).padding(end = 28.dp, bottom = 96.dp),
+                              horizontalAlignment = Alignment.End,
+                          ) {
+                              val intro = m?.markers?.firstOrNull { it.type == "intro" && position >= it.start && position < it.end }
+                              if (intro != null) {
+                                  OutlinedButton(
+                                      onClick = { player.seekTo(intro.end) },
+                                      colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xCC000000), contentColor = Color.White),
+                                  ) { Text("Skip Intro", fontWeight = FontWeight.Bold) }
+                              }
+                              val n = next
+                              if (m != null && n != null && inCredits(m)) {
+                                  if (countdown >= 0) {
+                                      Column(
+                                          Modifier.width(300.dp).clip(RoundedCornerShape(10.dp)).background(Color(0xE6141414)).padding(14.dp)
+                                      ) {
+                                          Text("Next episode in $countdown", color = Muted, fontSize = 12.sp)
+                                          Text(
+                                              "${n.epLabel} · ${n.title}",
+                                              color = Color.White,
+                                              fontWeight = FontWeight.Bold,
+                                              maxLines = 1,
+                                              overflow = TextOverflow.Ellipsis,
+                                          )
+                                          Spacer(Modifier.height(10.dp))
+                                          Row {
+                                              Button(
+                                                  onClick = { playNext() },
+                                                  colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
+                                              ) {
+                                                  Icon(Icons.Default.PlayArrow, null)
+                                                  Text("Play now")
+                                              }
+                                              Spacer(Modifier.width(8.dp))
+                                              TextButton(onClick = {
+                                                  creditsDismissed = true
+                                                  countdown = -1
+                                              }) { Text("Watch credits", color = Color.White) }
+                                          }
+                                      }
+                                  } else {
+                                      Button(
+                                          onClick = { playNext() },
+                                          colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
+                                      ) {
+                                          Icon(Icons.Default.SkipNext, null)
+                                          Spacer(Modifier.width(4.dp))
+                                          Text("Next Episode", fontWeight = FontWeight.Bold)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  if (showQuality) QualityDialog()
+                  if (showStreams) StreamsDialog()
+              }
+
+              @Composable
+              private fun TopBar(m: Item?) {
+                  Row(
+                      Modifier.fillMaxWidth()
+                          .background(Brush.verticalGradient(listOf(Color(0xB0000000), Color.Transparent)))
+                          .padding(horizontal = 12.dp, vertical = 10.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                      IconButton(onClick = { finish() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Color.White) }
+                      Column(Modifier.weight(1f)) {
+                          Text(m?.heading ?: offlineTitle ?: "", color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                          if (m != null && m.type == "episode") Text("${m.epLabel} · ${m.title}", color = Muted, maxLines = 1, fontSize = 13.sp)
+                          val mode = when {
+                              localPath != null -> "Downloaded"
+                              transcoding -> "Transcoding · " + Plex.qualityLabel(if (kbps > 0) kbps else 20000)
+                              else -> "Direct play"
+                          }
+                          Text(mode, color = Muted, fontSize = 11.sp)
+                      }
+                      if (localPath == null && m != null) {
+                          IconButton(onClick = { showQuality = true }) { Icon(Icons.Default.HighQuality, "Quality", tint = Color.White) }
+                          if (transcoding) IconButton(onClick = { showStreams = true }) { Icon(Icons.Default.Subtitles, "Audio & subtitles", tint = Color.White) }
+                      }
+                      if (next != null) IconButton(onClick = { playNext() }) { Icon(Icons.Default.SkipNext, "Next episode", tint = Color.White) }
+                  }
+              }
+
+              @Composable
+              private fun QualityDialog() {
+                  AlertDialog(
+                      onDismissRequest = { showQuality = false },
+                      title = { Text("Quality") },
+                      text = {
+                          Column {
+                              Plex.QUALITIES.forEach { (q, label) ->
+                                  Row(
+                                      Modifier.fillMaxWidth().clickable {
+                                          showQuality = false
+                                          if (q != kbps || (q == 0 && transcoding)) {
+                                              val pos = player.currentPosition
+                                              val wasTranscoding = transcoding
+                                              if (wasTranscoding) {
+                                                  val s = session
+                                                  Plex.bg.launch { Plex.stopTranscode(s) }
+                                              }
+                                              kbps = q
+                                              transcoding = q > 0
+                                              startPlayback(pos)
+                                          }
+                                      }.padding(vertical = 4.dp),
+                                      verticalAlignment = Alignment.CenterVertically,
+                                  ) {
+                                      RadioButton(selected = kbps == q, onClick = null)
+                                      Spacer(Modifier.width(8.dp))
+                                      Text(label)
+                                  }
+                              }
+                          }
+                      },
+                      confirmButton = { TextButton(onClick = { showQuality = false }) { Text("Close") } },
+                  )
+              }
+
+              @Composable
+              private fun StreamsDialog() {
+                  val m = current
+                  val part = m?.media?.firstOrNull()?.parts?.firstOrNull()
+                  if (m == null || part == null) {
+                      showStreams = false
+                      return
+                  }
+                  val audio = part.streams.filter { it.type == 2 }
+                  val subs = part.streams.filter { it.type == 3 }
+                  fun choose(a: Long?, s: Long?) {
+                      showStreams = false
+                      val pos = player.currentPosition
+                      lifecycleScope.launch {
+                          runCatching { Plex.setStreams(part.id, a, s) }
+                          current = runCatching { Plex.metadata(m.ratingKey) }.getOrNull() ?: m
+                          restartAt(pos)
+                      }
+                  }
+                  AlertDialog(
+                      onDismissRequest = { showStreams = false },
+                      title = { Text("Audio & Subtitles") },
+                      text = {
+                          LazyColumn(Modifier.heightIn(max = 420.dp)) {
+                              item { Text("AUDIO", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                              items(audio) { s -> StreamRow(s.title, s.selected) { choose(s.id, null) } }
+                              item { Text("SUBTITLES", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp)) }
+                              item { StreamRow("Off", subs.none { it.selected }) { choose(null, 0L) } }
+                              items(subs) { s -> StreamRow(s.title, s.selected) { choose(null, s.id) } }
+                          }
+                      },
+                      confirmButton = { TextButton(onClick = { showStreams = false }) { Text("Close") } },
+                  )
+              }
+
+              @Composable
+              private fun StreamRow(label: String, selected: Boolean, onClick: () -> Unit) {
+                  Row(
+                      Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 4.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                      RadioButton(selected = selected, onClick = null)
+                      Spacer(Modifier.width(8.dp))
+                      Text(label, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                  }
+              }
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/java/com/feynos/plex"
+          cat > "app/src/main/java/com/feynos/plex/Plex.kt" <<'FEYNOS_EOF'
+          package com.feynos.plex
+
+          import android.content.Context
+          import android.os.Build
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.async
+          import kotlinx.coroutines.awaitAll
+          import kotlinx.coroutines.coroutineScope
+          import kotlinx.coroutines.withContext
+          import okhttp3.FormBody
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.URLEncoder
+          import java.util.concurrent.TimeUnit
+
+          class PlexException(val code: Int, msg: String) : Exception(msg)
+
+          data class Pin(val id: Long, val code: String)
+          data class HomeUser(val id: String, val title: String, val thumb: String?, val protected: Boolean, val admin: Boolean)
+          data class Conn(val uri: String, val local: Boolean, val relay: Boolean)
+          data class Server(val name: String, val id: String, val token: String?, val owned: Boolean, val conns: List<Conn>)
+
+          object Plex {
+              const val PRODUCT = "Feynos Plex"
+
+              val QUALITIES = listOf(
+                  0 to "Original (direct play)",
+                  20000 to "20 Mbps · 1080p",
+                  12000 to "12 Mbps · 1080p",
+                  8000 to "8 Mbps · 1080p",
+                  4000 to "4 Mbps · 720p",
+                  2000 to "2 Mbps · 720p",
+                  1000 to "1 Mbps · 480p",
+              )
+
+              fun qualityLabel(kbps: Int) = QUALITIES.firstOrNull { it.first == kbps }?.second ?: "${kbps / 1000} Mbps"
+
+              lateinit var prefs: Prefs
+              lateinit var app: Context
+              val bg = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+              val http: OkHttpClient = OkHttpClient.Builder()
+                  .connectTimeout(12, TimeUnit.SECONDS)
+                  .readTimeout(30, TimeUnit.SECONDS)
+                  .build()
+              private val fast: OkHttpClient = http.newBuilder()
+                  .connectTimeout(4, TimeUnit.SECONDS)
+                  .readTimeout(6, TimeUnit.SECONDS)
+                  .build()
+
+              fun init(ctx: Context) {
+                  app = ctx.applicationContext
+                  prefs = Prefs(app)
+              }
+
+              fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
+
+              fun headers(): Map<String, String> = mapOf(
+                  "X-Plex-Product" to PRODUCT,
+                  "X-Plex-Version" to BuildConfig.VERSION_NAME,
+                  "X-Plex-Client-Identifier" to prefs.clientId,
+                  "X-Plex-Platform" to "Android",
+                  "X-Plex-Platform-Version" to Build.VERSION.RELEASE,
+                  "X-Plex-Device" to Build.MODEL,
+                  "X-Plex-Device-Name" to "${Build.MANUFACTURER} ${Build.MODEL}",
+                  "X-Plex-Model" to Build.MODEL,
+                  "X-Plex-Provides" to "player",
+                  "Accept" to "application/json",
+              )
+
+              suspend fun request(
+                  url: String,
+                  token: String?,
+                  method: String = "GET",
+                  form: Map<String, String>? = null,
+                  quick: Boolean = false,
+              ): String = withContext(Dispatchers.IO) {
+                  val b = Request.Builder().url(url)
+                  headers().forEach { (k, v) -> b.header(k, v) }
+                  if (token != null) b.header("X-Plex-Token", token)
+                  when {
+                      form != null -> {
+                          val fb = FormBody.Builder()
+                          form.forEach { (k, v) -> fb.add(k, v) }
+                          b.method(method, fb.build())
+                      }
+                      method == "GET" || method == "DELETE" -> b.method(method, null)
+                      else -> b.method(method, ByteArray(0).toRequestBody(null))
+                  }
+                  val client = if (quick) fast else http
+                  client.newCall(b.build()).execute().use { r ->
+                      val body = r.body?.string() ?: ""
+                      if (!r.isSuccessful) throw PlexException(r.code, "HTTP ${r.code}")
+                      body
+                  }
+              }
+
+              // ---------------- plex.tv account ----------------
+
+              suspend fun createPin(): Pin {
+                  val o = JSONObject(request("https://plex.tv/api/v2/pins", null, "POST"))
+                  return Pin(o.getLong("id"), o.getString("code"))
+              }
+
+              suspend fun pinToken(id: Long): String? = JSONObject(request("https://plex.tv/api/v2/pins/$id", null)).s("authToken")
+
+              fun linkUrl(code: String) =
+                  "https://app.plex.tv/auth#?clientID=${enc(prefs.clientId)}&code=${enc(code)}&context%5Bdevice%5D%5Bproduct%5D=${enc(PRODUCT)}"
+
+              suspend fun signIn(login: String, password: String, code: String): String {
+                  val form = mutableMapOf("login" to login, "password" to password, "rememberMe" to "true")
+                  if (code.isNotBlank()) form["verificationCode"] = code
+                  val o = JSONObject(request("https://plex.tv/api/v2/users/signin", null, "POST", form))
+                  return o.getString("authToken")
+              }
+
+              suspend fun account(token: String): JSONObject = JSONObject(request("https://plex.tv/api/v2/user", token))
+
+              suspend fun homeUsers(): List<HomeUser> {
+                  val txt = request("https://plex.tv/api/v2/home/users", prefs.accountToken).trim()
+                  val arr = if (txt.startsWith("[")) JSONArray(txt) else JSONObject(txt).optJSONArray("users")
+                  return arr.objs().map {
+                      HomeUser(
+                          id = it.s("uuid") ?: it.s("id") ?: "",
+                          title = it.s("title") ?: it.s("username") ?: "User",
+                          thumb = it.s("thumb"),
+                          protected = it.optBoolean("protected"),
+                          admin = it.optBoolean("admin"),
+                      )
+                  }
+              }
+
+              suspend fun switchUser(u: HomeUser, pin: String?): String {
+                  val url = "https://plex.tv/api/v2/home/users/${u.id}/switch" + (pin?.let { "?pin=${enc(it)}" } ?: "")
+                  return JSONObject(request(url, prefs.accountToken, "POST")).getString("authToken")
+              }
+
+              suspend fun servers(): List<Server> {
+                  val txt = request("https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1", prefs.userToken)
+                  return JSONArray(txt).objs()
+                      .filter { (it.s("provides") ?: "").contains("server") }
+                      .map { o ->
+                          Server(
+                              name = o.s("name") ?: "Plex Server",
+                              id = o.s("clientIdentifier") ?: "",
+                              token = o.s("accessToken") ?: prefs.userToken,
+                              owned = o.optBoolean("owned"),
+                              conns = o.optJSONArray("connections").objs().mapNotNull { c ->
+                                  c.s("uri")?.let { Conn(it, c.optBoolean("local"), c.optBoolean("relay")) }
+                              },
+                          )
+                      }
+              }
+
+              /** Returns the server's machineIdentifier if reachable. */
+              suspend fun probe(uri: String, token: String?): String =
+                  JSONObject(request("$uri/identity", token, quick = true)).optJSONObject("MediaContainer")?.s("machineIdentifier") ?: ""
+
+              /** Tries every connection in parallel and returns the best one that answers. */
+              suspend fun connect(s: Server): String? = coroutineScope {
+                  val ordered = s.conns.sortedBy { c ->
+                      when {
+                          c.local && !c.relay -> 0
+                          !c.relay -> 1
+                          else -> 2
+                      }
+                  }
+                  ordered.map { c ->
+                      async { runCatching { probe(c.uri, s.token); c.uri }.getOrNull() }
+                  }.awaitAll().firstOrNull { it != null }
+              }
+
+              // ---------------- Plex Media Server ----------------
+
+              private val base: String get() = prefs.serverUri ?: ""
+              private val stoken: String? get() = prefs.serverToken
+
+              suspend fun pms(path: String, method: String = "GET"): JSONObject {
+                  val txt = request(base + path, stoken, method)
+                  if (txt.isBlank()) return JSONObject()
+                  return runCatching { JSONObject(txt).optJSONObject("MediaContainer") ?: JSONObject() }.getOrDefault(JSONObject())
+              }
+
+              private val videoTypes = setOf("movie", "show", "season", "episode")
+
+              suspend fun homeHubs(): List<Hub> =
+                  pms("/hubs?count=20&includeLibraryPlaylists=0").hubs()
+                      .map { h -> h.copy(items = h.items.filter { it.type in videoTypes }) }
+                      .filter { it.items.isNotEmpty() }
+                      .sortedBy {
+                          when {
+                              it.identifier.contains("continue") -> 0
+                              it.identifier.contains("ondeck") -> 1
+                              else -> 2
+                          }
+                      }
+
+              suspend fun libraries(): List<Library> =
+                  pms("/library/sections").optJSONArray("Directory").objs()
+                      .map { Library(it.s("key") ?: "", it.s("title") ?: "", it.s("type") ?: "") }
+                      .filter { it.type == "movie" || it.type == "show" }
+
+              suspend fun sectionHubs(key: String): List<Hub> =
+                  pms("/hubs/sections/$key?count=20").hubs().filter { it.items.isNotEmpty() }
+
+              suspend fun browse(key: String, type: String, sort: String, genre: String?, unwatched: Boolean, start: Int, size: Int): Pair<List<Item>, Int> {
+                  val t = if (type == "show") 2 else 1
+                  var p = "/library/sections/$key/all?type=$t&sort=${enc(sort)}&X-Plex-Container-Start=$start&X-Plex-Container-Size=$size"
+                  if (genre != null) p += "&genre=${enc(genre)}"
+                  if (unwatched) p += "&unwatched=1"
+                  val mc = pms(p)
+                  return mc.metadata() to mc.optInt("totalSize", -1)
+              }
+
+              suspend fun genres(key: String, type: String): List<Tag> =
+                  pms("/library/sections/$key/genre?type=${if (type == "show") 2 else 1}").optJSONArray("Directory").objs().map {
+                      val k = it.s("key") ?: ""
+                      Tag(if (k.contains("genre=")) k.substringAfter("genre=").substringBefore("&") else k, it.s("title") ?: "")
+                  }
+
+              suspend fun metadata(rk: String): Item? =
+                  pms("/library/metadata/$rk?includeExtras=1&includeMarkers=1&includeRelated=1&includeOnDeck=1&checkFiles=0").metadata().firstOrNull()
+
+              suspend fun children(rk: String): List<Item> = pms("/library/metadata/$rk/children").metadata()
+              suspend fun allLeaves(rk: String): List<Item> = pms("/library/metadata/$rk/allLeaves").metadata()
+
+              suspend fun search(q: String): List<Hub> =
+                  pms("/hubs/search?query=${enc(q)}&limit=30").hubs()
+                      .map { h -> h.copy(items = h.items.filter { it.type in videoTypes }) }
+                      .filter { it.items.isNotEmpty() }
+
+              suspend fun scrobble(rk: String, watched: Boolean) {
+                  request(base + "/:/${if (watched) "scrobble" else "unscrobble"}?key=$rk&identifier=com.plexapp.plugins.library", stoken)
+              }
+
+              suspend fun timeline(rk: String, state: String, time: Long, duration: Long) {
+                  runCatching {
+                      request(
+                          base + "/:/timeline?ratingKey=$rk&key=${enc("/library/metadata/$rk")}&state=$state&time=$time&duration=$duration&playbackTime=$time",
+                          stoken,
+                      )
+                  }
+              }
+
+              suspend fun setStreams(partId: Long, audio: Long?, subtitle: Long?) {
+                  var q = "/library/parts/$partId?allParts=1"
+                  if (audio != null) q += "&audioStreamID=$audio"
+                  if (subtitle != null) q += "&subtitleStreamID=$subtitle"
+                  request(base + q, stoken, "PUT")
+              }
+
+              suspend fun stopTranscode(session: String) {
+                  runCatching { request(base + "/video/:/transcode/universal/stop?session=$session", stoken) }
+              }
+
+              suspend fun findOnServer(guid: String, title: String, year: Int): Item? {
+                  runCatching {
+                      pms("/library/all?guid=${enc(guid)}").metadata().firstOrNull { it.type == "movie" || it.type == "show" }
+                  }.getOrNull()?.let { return it }
+                  val found = runCatching { search(title).flatMap { it.items } }.getOrDefault(emptyList())
+                  return found.firstOrNull { it.guid == guid }
+                      ?: found.firstOrNull { (it.type == "movie" || it.type == "show") && it.title.equals(title, true) && (year == 0 || it.year == year) }
+              }
+
+              // ---------------- URLs ----------------
+
+              fun img(path: String?, w: Int, h: Int): String? {
+                  if (path.isNullOrEmpty()) return null
+                  if (path.startsWith("http")) return path
+                  return "$base/photo/:/transcode?width=$w&height=$h&minSize=1&upscale=1&url=${enc(path)}&X-Plex-Token=${stoken ?: ""}"
+              }
+
+              fun directUrl(part: Part) = "$base${part.key}?X-Plex-Token=${stoken ?: ""}"
+              fun downloadUrl(part: Part) = "$base${part.key}?download=1&X-Plex-Token=${stoken ?: ""}"
+              fun streamUrl(key: String) = "$base$key?X-Plex-Token=${stoken ?: ""}"
+
+              fun transcodeUrl(rk: String, session: String, kbps: Int): String {
+                  val res = when {
+                      kbps >= 8000 -> "1920x1080"
+                      kbps >= 2000 -> "1280x720"
+                      else -> "854x480"
+                  }
+                  val profileExtra =
+                      "add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mpegts&videoCodec=h264&audioCodec=aac,ac3,eac3)"
+                  val params = mutableListOf(
+                      "path" to "/library/metadata/$rk",
+                      "mediaIndex" to "0",
+                      "partIndex" to "0",
+                      "protocol" to "hls",
+                      "fastSeek" to "1",
+                      "directPlay" to "0",
+                      "directStream" to "1",
+                      "directStreamAudio" to "1",
+                      "videoQuality" to "100",
+                      "maxVideoBitrate" to "$kbps",
+                      "videoResolution" to res,
+                      "subtitleSize" to "100",
+                      "audioBoost" to "100",
+                      "subtitles" to "burn",
+                      "copyts" to "1",
+                      "autoAdjustQuality" to "0",
+                      "hasMDE" to "1",
+                      "location" to "lan",
+                      "session" to session,
+                      "X-Plex-Session-Identifier" to session,
+                      "X-Plex-Client-Profile-Extra" to profileExtra,
+                      "X-Plex-Token" to (stoken ?: ""),
+                  )
+                  headers().filterKeys { it.startsWith("X-Plex") }.forEach { (k, v) -> params.add(k to v) }
+                  return "$base/video/:/transcode/universal/start.m3u8?" + params.joinToString("&") { "${enc(it.first)}=${enc(it.second)}" }
+              }
+
+              // ---------------- Watchlist (plex.tv Discover) ----------------
+
+              suspend fun watchlist(): List<Item> =
+                  JSONObject(
+                      request(
+                          "https://discover.provider.plex.tv/library/sections/watchlist/all?X-Plex-Container-Start=0&X-Plex-Container-Size=300",
+                          prefs.userToken,
+                      )
+                  ).optJSONObject("MediaContainer")?.metadata() ?: emptyList()
+
+              suspend fun setWatchlist(guid: String, add: Boolean) {
+                  val id = guid.substringAfterLast('/')
+                  val action = if (add) "addToWatchlist" else "removeFromWatchlist"
+                  request("https://discover.provider.plex.tv/actions/$action?ratingKey=${enc(id)}", prefs.userToken, "PUT")
+              }
+          }
+
+          object Watchlist {
+              var items by mutableStateOf<List<Item>>(emptyList())
+              var loaded by mutableStateOf(false)
+
+              fun has(guid: String?): Boolean = guid != null && items.any { it.guid == guid }
+              fun supports(item: Item): Boolean = (item.type == "movie" || item.type == "show") && item.guid?.startsWith("plex://") == true
+
+              suspend fun refresh() {
+                  runCatching { items = Plex.watchlist() }
+                  loaded = true
+              }
+
+              suspend fun toggle(item: Item) {
+                  val g = item.guid ?: return
+                  val add = !has(g)
+                  items = if (add) listOf(item) + items else items.filter { it.guid != g }
+                  runCatching { Plex.setWatchlist(g, add) }
+                  refresh()
+              }
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/java/com/feynos/plex"
+          cat > "app/src/main/java/com/feynos/plex/Prefs.kt" <<'FEYNOS_EOF'
+          package com.feynos.plex
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import java.util.UUID
+          import kotlin.properties.ReadWriteProperty
+          import kotlin.reflect.KProperty
+
+          class Prefs(ctx: Context) {
+              val sp: SharedPreferences = ctx.getSharedPreferences("feynos_plex", Context.MODE_PRIVATE)
+
+              private fun str(key: String) = object : ReadWriteProperty<Any?, String?> {
+                  override fun getValue(thisRef: Any?, property: KProperty<*>): String? = sp.getString(key, null)
+                  override fun setValue(thisRef: Any?, property: KProperty<*>, value: String?) {
+                      sp.edit().putString(key, value).apply()
+                  }
+              }
+
+              private fun bool(key: String, def: Boolean) = object : ReadWriteProperty<Any?, Boolean> {
+                  override fun getValue(thisRef: Any?, property: KProperty<*>): Boolean = sp.getBoolean(key, def)
+                  override fun setValue(thisRef: Any?, property: KProperty<*>, value: Boolean) {
+                      sp.edit().putBoolean(key, value).apply()
+                  }
+              }
+
+              private fun int(key: String, def: Int) = object : ReadWriteProperty<Any?, Int> {
+                  override fun getValue(thisRef: Any?, property: KProperty<*>): Int = sp.getInt(key, def)
+                  override fun setValue(thisRef: Any?, property: KProperty<*>, value: Int) {
+                      sp.edit().putInt(key, value).apply()
+                  }
+              }
+
+              val clientId: String by lazy {
+                  sp.getString("client_id", null) ?: UUID.randomUUID().toString().also { sp.edit().putString("client_id", it).apply() }
+              }
+
+              var accountToken by str("account_token")
+              var userToken by str("user_token")
+              var userTitle by str("user_title")
+              var userThumb by str("user_thumb")
+              var serverName by str("server_name")
+              var serverId by str("server_id")
+              var serverUri by str("server_uri")
+              var serverToken by str("server_token")
+              var downloadsJson by str("downloads")
+
+              /** Streaming bitrate cap in kbps; 0 means Original / direct play. */
+              var quality by int("quality", 0)
+              var autoplayNext by bool("autoplay_next", true)
+              var autoSkipIntro by bool("auto_skip_intro", false)
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/java/com/feynos/plex"
+          cat > "app/src/main/java/com/feynos/plex/Settings.kt" <<'FEYNOS_EOF'
+          @file:OptIn(ExperimentalMaterial3Api::class)
+
+          package com.feynos.plex
+
+          import android.app.DownloadManager
+          import android.content.Intent
+          import androidx.compose.foundation.*
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.*
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.Logout
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import coil.compose.AsyncImage
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import java.io.File
+
+          @Composable
+          fun MoreScreen() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val p = Plex.prefs
+              var quality by remember { mutableIntStateOf(p.quality) }
+              var autoplay by remember { mutableStateOf(p.autoplayNext) }
+              var skipIntro by remember { mutableStateOf(p.autoSkipIntro) }
+              var qualityDialog by remember { mutableStateOf(false) }
+              var update by remember { mutableStateOf<Updater.Release?>(null) }
+              var checking by remember { mutableStateOf(false) }
+
+              LazyColumn(Modifier.fillMaxSize()) {
+                  item { ScreenTitle("More") }
+                  item {
+                      Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                          AsyncImage(
+                              model = p.userThumb,
+                              contentDescription = null,
+                              contentScale = ContentScale.Crop,
+                              modifier = Modifier.size(56.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF444444)),
+                          )
+                          Spacer(Modifier.width(14.dp))
+                          Column {
+                              Text(p.userTitle ?: "Profile", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                              Text(p.serverName ?: "", color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                          }
+                      }
+                  }
+                  item { SettingRow(Icons.Default.SwapHoriz, "Switch profile") { Session.switchProfile() } }
+                  item { SettingRow(Icons.Default.Dns, "Switch server", p.serverName) { Session.switchServer() } }
+
+                  item { SectionLabel("Playback") }
+                  item { SettingRow(Icons.Default.HighQuality, "Streaming quality", Plex.qualityLabel(quality)) { qualityDialog = true } }
+                  item {
+                      SwitchRow(Icons.Default.SkipNext, "Autoplay next episode", autoplay) {
+                          autoplay = it
+                          p.autoplayNext = it
+                      }
+                  }
+                  item {
+                      SwitchRow(Icons.Default.FastForward, "Skip intros automatically", skipIntro) {
+                          skipIntro = it
+                          p.autoSkipIntro = it
+                      }
+                  }
+
+                  item { SectionLabel("App") }
+                  item {
+                      SettingRow(Icons.Default.SystemUpdate, if (checking) "Checking…" else "Check for updates", "Version ${BuildConfig.VERSION_NAME}") {
+                          if (!checking) {
+                              checking = true
+                              scope.launch {
+                                  val r = Updater.check()
+                                  checking = false
+                                  if (r != null) update = r else ctx.toast("You're on the latest version")
+                              }
+                          }
+                      }
+                  }
+                  item { SettingRow(Icons.AutoMirrored.Filled.Logout, "Sign out") { Session.signOut() } }
+                  item { Spacer(Modifier.height(24.dp)) }
+              }
+
+              if (qualityDialog) {
+                  AlertDialog(
+                      onDismissRequest = { qualityDialog = false },
+                      title = { Text("Streaming quality") },
+                      text = {
+                          Column {
+                              Plex.QUALITIES.forEach { (q, label) ->
+                                  Row(
+                                      Modifier.fillMaxWidth().clickable {
+                                          quality = q
+                                          p.quality = q
+                                          qualityDialog = false
+                                      }.padding(vertical = 4.dp),
+                                      verticalAlignment = Alignment.CenterVertically,
+                                  ) {
+                                      RadioButton(selected = quality == q, onClick = null)
+                                      Spacer(Modifier.width(8.dp))
+                                      Text(label)
+                                  }
+                              }
+                              Text(
+                                  "Original plays files untouched and falls back to transcoding automatically if your phone can't play them.",
+                                  color = Muted,
+                                  fontSize = 12.sp,
+                                  modifier = Modifier.padding(top = 8.dp),
+                              )
+                          }
+                      },
+                      confirmButton = { TextButton(onClick = { qualityDialog = false }) { Text("Close") } },
+                  )
+              }
+              update?.let { r -> UpdateDialog(r) { update = null } }
+          }
+
+          @Composable
+          private fun SectionLabel(text: String) {
+              Text(
+                  text.uppercase(),
+                  color = Accent,
+                  style = MaterialTheme.typography.labelMedium,
+                  fontWeight = FontWeight.Bold,
+                  modifier = Modifier.padding(start = 16.dp, top = 20.dp, bottom = 4.dp),
+              )
+          }
+
+          @Composable
+          private fun SettingRow(icon: ImageVector, title: String, subtitle: String? = null, onClick: () -> Unit) {
+              Row(
+                  Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+              ) {
+                  Icon(icon, null, tint = Muted)
+                  Spacer(Modifier.width(16.dp))
+                  Column(Modifier.weight(1f)) {
+                      Text(title)
+                      if (!subtitle.isNullOrEmpty()) Text(subtitle, color = Muted, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  }
+              }
+          }
+
+          @Composable
+          private fun SwitchRow(icon: ImageVector, title: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+              Row(
+                  Modifier.fillMaxWidth().clickable { onChange(!checked) }.padding(horizontal = 16.dp, vertical = 8.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+              ) {
+                  Icon(icon, null, tint = Muted)
+                  Spacer(Modifier.width(16.dp))
+                  Text(title, Modifier.weight(1f))
+                  Switch(checked = checked, onCheckedChange = onChange)
+              }
+          }
+
+          @Composable
+          fun DownloadsScreen() {
+              val ctx = LocalContext.current
+              var tick by remember { mutableIntStateOf(0) }
+              LaunchedEffect(Unit) {
+                  while (true) {
+                      delay(1000)
+                      tick++
+                  }
+              }
+              Column(Modifier.fillMaxSize()) {
+                  ScreenTitle("Downloads")
+                  val list = Downloads.list.toList()
+                  if (list.isEmpty()) {
+                      Message("Nothing downloaded yet.\nTap the download icon on any movie or episode to watch it offline.")
+                  } else {
+                      LazyColumn(Modifier.fillMaxSize()) {
+                          items(list) { d ->
+                              val st = remember(tick, d.dmId) { Downloads.status(ctx, d) }
+                              val done = st.state == DownloadManager.STATUS_SUCCESSFUL
+                              val failed = st.state == DownloadManager.STATUS_FAILED
+                              Row(
+                                  Modifier.fillMaxWidth().clickable(enabled = done) {
+                                      ctx.startActivity(
+                                          Intent(ctx, PlayerActivity::class.java)
+                                              .putExtra("rk", d.rk)
+                                              .putExtra("local", d.file)
+                                              .putExtra("autoResume", true)
+                                      )
+                                  }.padding(horizontal = 16.dp, vertical = 10.dp),
+                                  verticalAlignment = Alignment.CenterVertically,
+                              ) {
+                                  AsyncImage(
+                                      model = File(d.thumb),
+                                      contentDescription = null,
+                                      contentScale = ContentScale.Crop,
+                                      modifier = Modifier.width(64.dp).aspectRatio(2f / 3f).clip(RoundedCornerShape(4.dp)).background(Color(0xFF222222)),
+                                  )
+                                  Spacer(Modifier.width(14.dp))
+                                  Column(Modifier.weight(1f)) {
+                                      Text(d.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                      if (d.subtitle.isNotEmpty()) Text(d.subtitle, color = Muted, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                      when {
+                                          done -> Text(fmtDuration(d.duration).ifEmpty { "Ready" }, color = Muted, style = MaterialTheme.typography.bodySmall)
+                                          failed -> Text("Download failed", color = Danger, style = MaterialTheme.typography.bodySmall)
+                                          else -> {
+                                              Text("Downloading ${(st.progress * 100).toInt()}%", color = Accent, style = MaterialTheme.typography.bodySmall)
+                                              LinearProgressIndicator(
+                                                  progress = { st.progress },
+                                                  modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                                  color = Accent,
+                                              )
+                                          }
+                                      }
+                                  }
+                                  if (done) Icon(Icons.Default.PlayCircle, null, tint = Color.White, modifier = Modifier.padding(horizontal = 6.dp))
+                                  IconButton(onClick = { Downloads.delete(ctx, d) }) { Icon(Icons.Default.Delete, "Delete", tint = Muted) }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/res/drawable"
+          cat > "app/src/main/res/drawable/ic_launcher_foreground.xml" <<'FEYNOS_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FFE5A00D"
+                  android:pathData="M40,30 L70,30 L70,40 L51,40 L51,49 L65,49 L65,59 L51,59 L51,78 L40,78 Z" />
+              <path
+                  android:fillColor="#FFE5A00D"
+                  android:pathData="M70,62 L80,70 L70,78 Z" />
+          </vector>
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/res/mipmap-anydpi-v26"
+          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" <<'FEYNOS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+              <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/res/values"
+          cat > "app/src/main/res/values/themes.xml" <<'FEYNOS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@android:color/transparent</item>
+                  <item name="android:navigationBarColor">@color/bg</item>
+              </style>
+              <color name="bg">#FF0A0A0A</color>
+              <color name="icon_bg">#FF141414</color>
+          </resources>
+          FEYNOS_EOF
+
+          mkdir -p "app/src/main/res/xml"
+          cat > "app/src/main/res/xml/file_paths.xml" <<'FEYNOS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="cache" path="." />
+          </paths>
+          FEYNOS_EOF
+
+          cat > "build.gradle.kts" <<'FEYNOS_EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          FEYNOS_EOF
+
+          cat > "gradle.properties" <<'FEYNOS_EOF'
+          org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          FEYNOS_EOF
+
+          cat > "settings.gradle.kts" <<'FEYNOS_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FeynosPlex"
+          include(":app")
+          FEYNOS_EOF
+
+      - name: Signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD || 'feynosplex' }}
+        run: |
+          set -e
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > release.jks
+          elif [ -f keystore/release.jks ]; then
+            cp keystore/release.jks release.jks
+          else
+            # First build: make a key and keep it in the repo so every future
+            # build is signed the same way (needed for in-app updates).
+            keytool -genkeypair -keystore release.jks -alias feynos -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass "$KS_PASS" -keypass "$KS_PASS" -dname "CN=Feynos Plex"
+            mkdir -p keystore
+            cp release.jks keystore/release.jks
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add keystore/release.jks
+            git commit -m "Add app signing key [skip ci]"
+            git push
+          fi
+
+      - name: Build APK
+        env:
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD || 'feynosplex' }}
+        run: |
+          gradle --no-daemon --stacktrace assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk "FeynosPlex-1.0.${GITHUB_RUN_NUMBER}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FeynosPlex-1.0.${{ github.run_number }}
+          path: FeynosPlex-*.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Feynos Plex 1.0.${{ github.run_number }}
+          body: ${{ github.event.head_commit.message || 'Manual build' }}
+          files: FeynosPlex-*.apk
+          make_latest: true
